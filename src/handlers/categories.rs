@@ -1,14 +1,19 @@
 use crate::errors::AppError;
+use crate::extractors::{AdminUser, AuthUser};
 use crate::models::category::{Category, CreateCategory, UpdateCategory};
 use axum::{
     extract::{Path, State},
     Json,
 };
+use serde_json::json;
 use sqlx::PgPool;
 
-pub async fn list(State(pool): State<PgPool>) -> Result<Json<Vec<Category>>, AppError> {
+pub async fn list(
+    State(pool): State<PgPool>,
+    AuthUser(_user): AuthUser,
+) -> Result<Json<Vec<Category>>, AppError> {
     let categories = sqlx::query_as::<_, Category>(
-        r#"SELECT id, name, "createdAt", "updatedAt" FROM categories ORDER BY id"#,
+        r#"SELECT id, name, "createdAt", "updatedAt" FROM categories ORDER BY name"#,
     )
     .fetch_all(&pool)
     .await?;
@@ -18,6 +23,7 @@ pub async fn list(State(pool): State<PgPool>) -> Result<Json<Vec<Category>>, App
 
 pub async fn get_one(
     State(pool): State<PgPool>,
+    AuthUser(_user): AuthUser,
     Path(id): Path<i32>,
 ) -> Result<Json<Category>, AppError> {
     let category = sqlx::query_as::<_, Category>(
@@ -32,6 +38,7 @@ pub async fn get_one(
 
 pub async fn create(
     State(pool): State<PgPool>,
+    AdminUser(_user): AdminUser,
     Json(payload): Json<CreateCategory>,
 ) -> Result<Json<Category>, AppError> {
     let category = sqlx::query_as::<_, Category>(
@@ -48,9 +55,10 @@ pub async fn create(
 
 pub async fn update(
     State(pool): State<PgPool>,
+    AdminUser(_user): AdminUser,
     Path(id): Path<i32>,
     Json(payload): Json<UpdateCategory>,
-) -> Result<Json<Category>, AppError> {
+) -> Result<Json<serde_json::Value>, AppError> {
     let category = sqlx::query_as::<_, Category>(
         r#"UPDATE categories SET
              name = COALESCE($1, name),
@@ -63,13 +71,17 @@ pub async fn update(
     .fetch_one(&pool)
     .await?;
 
-    Ok(Json(category))
+    Ok(Json(json!({
+        "message": "Categoría actualizada con éxito",
+        "category": category
+    })))
 }
 
 pub async fn delete(
     State(pool): State<PgPool>,
+    AdminUser(_user): AdminUser,
     Path(id): Path<i32>,
-) -> Result<axum::http::StatusCode, AppError> {
+) -> Result<(axum::http::StatusCode, Json<serde_json::Value>), AppError> {
     let result = sqlx::query("DELETE FROM categories WHERE id = $1")
         .bind(id)
         .execute(&pool)
@@ -79,5 +91,8 @@ pub async fn delete(
         return Err(AppError::NotFound);
     }
 
-    Ok(axum::http::StatusCode::NO_CONTENT)
+    Ok((
+        axum::http::StatusCode::OK,
+        Json(json!({"message": "Categoría eliminada correctamente"})),
+    ))
 }

@@ -38,6 +38,13 @@ pub struct RegisterUser {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct UpdateUser {
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub role: Option<Role>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct LoginRequest {
     pub username: String,
     pub password: String,
@@ -45,5 +52,7 @@ pub struct LoginRequest {
 
 #[derive(Debug, Serialize)]
 pub struct LoginResponse {
+    pub message: String,
     pub token: String,
+    pub user: UserPublic,
 }

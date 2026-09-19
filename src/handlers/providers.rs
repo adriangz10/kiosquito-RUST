@@ -1,15 +1,20 @@
 use crate::errors::AppError;
+use crate::extractors::{AdminUser, AuthUser};
 use crate::models::provider::{CreateProvider, Provider, UpdateProvider};
 use axum::{
     extract::{Path, State},
     Json,
 };
+use serde_json::json;
 use sqlx::PgPool;
 
-pub async fn list(State(pool): State<PgPool>) -> Result<Json<Vec<Provider>>, AppError> {
+pub async fn list(
+    State(pool): State<PgPool>,
+    AuthUser(_user): AuthUser,
+) -> Result<Json<Vec<Provider>>, AppError> {
     let providers = sqlx::query_as::<_, Provider>(
         r#"SELECT id, name, phone, direction, "createdAt", "updatedAt"
-           FROM providers ORDER BY id"#,
+           FROM providers ORDER BY name"#,
     )
     .fetch_all(&pool)
     .await?;
@@ -19,6 +24,7 @@ pub async fn list(State(pool): State<PgPool>) -> Result<Json<Vec<Provider>>, App
 
 pub async fn get_one(
     State(pool): State<PgPool>,
+    AuthUser(_user): AuthUser,
     Path(id): Path<i32>,
 ) -> Result<Json<Provider>, AppError> {
     let provider = sqlx::query_as::<_, Provider>(
@@ -34,6 +40,7 @@ pub async fn get_one(
 
 pub async fn create(
     State(pool): State<PgPool>,
+    AdminUser(_user): AdminUser,
     Json(payload): Json<CreateProvider>,
 ) -> Result<Json<Provider>, AppError> {
     let provider = sqlx::query_as::<_, Provider>(
@@ -52,6 +59,7 @@ pub async fn create(
 
 pub async fn update(
     State(pool): State<PgPool>,
+    AdminUser(_user): AdminUser,
     Path(id): Path<i32>,
     Json(payload): Json<UpdateProvider>,
 ) -> Result<Json<Provider>, AppError> {
@@ -76,8 +84,9 @@ pub async fn update(
 
 pub async fn delete(
     State(pool): State<PgPool>,
+    AdminUser(_user): AdminUser,
     Path(id): Path<i32>,
-) -> Result<axum::http::StatusCode, AppError> {
+) -> Result<(axum::http::StatusCode, Json<serde_json::Value>), AppError> {
     let result = sqlx::query("DELETE FROM providers WHERE id = $1")
         .bind(id)
         .execute(&pool)
@@ -87,5 +96,8 @@ pub async fn delete(
         return Err(AppError::NotFound);
     }
 
-    Ok(axum::http::StatusCode::NO_CONTENT)
+    Ok((
+        axum::http::StatusCode::OK,
+        Json(json!({"message": "Proveedor eliminado exitosamente."})),
+    ))
 }

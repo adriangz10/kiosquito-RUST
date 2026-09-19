@@ -1,270 +1,265 @@
 # Kiosquito Flow API
 
-API REST para la gestion de un kiosco, construida con Rust, Axum y PostgreSQL. Permite administrar productos, categorias, proveedores y usuarios, ademas de registrar usuarios y autenticar peticiones mediante JWT.
-
-## Tecnologias
-
-- Rust 2021
-- Axum 0.8
-- Tokio
-- SQLx 0.9 con PostgreSQL
-- Serde y serde_json
-- Argon2 para hash de contrasenas
-- JSON Web Tokens mediante `jsonwebtoken`
-- Chrono para fechas y expiracion de tokens
-- `rust_decimal` para valores monetarios
-- `tracing` para logs
+Backend REST para un kiosco, construido con Rust, Axum, SQLx y PostgreSQL. Incluye autenticacion JWT, inventario, ventas, clientes, caja, gastos, compras, cuentas corrientes y reportes financieros.
 
 ## Requisitos
 
-- Rust y Cargo instalados.
-- PostgreSQL en ejecucion.
-- Una base de datos con las tablas esperadas por las consultas del proyecto.
-- Variables de entorno configuradas.
+- Rust y Cargo.
+- PostgreSQL.
+- Base de datos creada y cargada con `kiosco_flow.sql`.
 
-El proyecto no incluye actualmente migraciones SQL, datos iniciales, documentacion OpenAPI ni scripts de despliegue.
+El archivo SQL de la raiz es el esquema utilizado por la aplicacion. Contiene tablas, enums, claves foraneas, indices y secuencias para usuarios, productos, ventas, compras, caja, cuentas corrientes, gastos y auditoria.
 
 ## Configuracion
 
-Crea un archivo `.env` en la raiz del proyecto:
+Crea un archivo `.env` en la raiz:
 
 ```env
 DATABASE_URL=postgres://usuario:contrasena@localhost:5432/kiosquito
-JWT_SECRET=una-clave-larga-y-segura
+JWT_SECRET=una-clave-de-al-menos-16-caracteres
 PORT=3000
+FRONTEND_URL=http://localhost:5173
 ```
 
-Variables disponibles:
+Variables:
 
-| Variable | Obligatoria | Descripcion |
+| Variable | Obligatoria | Uso |
 | --- | --- | --- |
-| `DATABASE_URL` | Si | URL de conexion a PostgreSQL. |
-| `JWT_SECRET` | Para autenticacion | Clave usada para firmar y validar JWT. |
-| `PORT` | No | Puerto HTTP. Por defecto es `3000`. |
+| `DATABASE_URL` | Si | Conexion PostgreSQL. |
+| `JWT_SECRET` | Si para login | Firma de tokens JWT. |
+| `PORT` | No | Puerto HTTP; por defecto `3000`. |
+| `FRONTEND_URL` | No | Origen CORS; por defecto `http://localhost:5173`. |
+| `INITIAL_ADMIN_USERNAME` | No | Usuario administrador inicial si no existen usuarios. |
+| `INITIAL_ADMIN_PASSWORD` | No | Password inicial, minimo 8 caracteres. |
 
-El servidor escucha en `0.0.0.0` y usa el puerto definido por `PORT`.
+Al iniciar, el backend asegura el cliente `Consumidor Final` con id `1`, sincroniza su secuencia y crea el administrador inicial si se proporcionan las dos variables `INITIAL_ADMIN_*` y la tabla de usuarios esta vacia.
 
 ## Instalacion y ejecucion
-
-Desde la carpeta del proyecto:
 
 ```powershell
 cargo build
 cargo run
 ```
 
-El servidor estara disponible en:
+La API queda disponible en `http://localhost:3000`.
 
-```text
-http://localhost:3000
-```
-
-Comandos utiles:
+Comandos de verificacion:
 
 ```powershell
+cargo fmt --check
 cargo check
 cargo test
-cargo fmt
-cargo fmt --check
 ```
 
-Si falta `DATABASE_URL` o PostgreSQL no esta disponible, la aplicacion termina durante el arranque.
+Actualmente no hay tests automatizados de integracion; `cargo test` verifica que el proyecto compile y ejecuta la suite existente, que todavia no contiene casos.
 
-## Endpoints
+## Autenticacion
 
-### Salud
+El healthcheck es publico:
 
-| Metodo | Ruta | Autenticacion | Descripcion |
-| --- | --- | --- | --- |
-| `GET` | `/health` | No | Devuelve el estado configurado del servicio. |
+```http
+GET /health
+```
 
-Respuesta:
+Respuesta normal:
 
 ```json
-{
-  "status": "Base de datos conectada"
-}
+{"status":"ok"}
 ```
 
-> Nota: el handler actual no ejecuta una consulta contra PostgreSQL; por tanto, esta respuesta no confirma por si sola que la base de datos siga disponible.
+El login tambien es publico:
 
-### Autenticacion
+```http
+POST /api/auth/login
+Content-Type: application/json
 
-| Metodo | Ruta | Autenticacion | Descripcion |
-| --- | --- | --- | --- |
-| `POST` | `/auth/register` | No | Registra un usuario. |
-| `POST` | `/auth/login` | No | Valida credenciales y devuelve un JWT. |
-
-Registro:
-
-```json
-{
-  "username": "empleado1",
-  "password": "secreto",
-  "role": "Empleado"
-}
+{"username":"admin","password":"una-password"}
 ```
 
-Inicio de sesion:
+La respuesta contiene `message`, `token` y `user`. El token dura una hora y debe enviarse asi:
 
-```json
-{
-  "username": "empleado1",
-  "password": "secreto"
-}
+```http
+Authorization: Bearer <token>
+Content-Type: application/json
 ```
 
-Respuesta:
+Las rutas financieras, de inventario, categorias, proveedores y usuarios requieren JWT. Las operaciones de administracion requieren el rol `Administrador`.
 
-```json
-{
-  "token": "<jwt>"
-}
-```
+- `401`: token ausente, invalido o vencido.
+- `403`: rol insuficiente.
+- `400`: datos invalidos o regla de negocio incumplida.
+- `404`: entidad inexistente.
 
-Los roles disponibles son `Administrador` y `Empleado`.
+Los errores se devuelven como `{ "message": "..." }`.
 
-### Productos
+Despues de cinco intentos fallidos de login, el usuario queda bloqueado durante cinco minutos.
 
-| Metodo | Ruta | Autenticacion | Descripcion |
-| --- | --- | --- | --- |
-| `GET` | `/products` | No | Lista todos los productos. |
-| `POST` | `/products` | No | Crea un producto. |
-| `GET` | `/products/{id}` | No | Obtiene un producto. |
-| `PUT` | `/products/{id}` | No | Actualiza un producto. |
-| `DELETE` | `/products/{id}` | No | Elimina un producto. |
+## Rutas
 
-Campos de producto:
-
-```json
-{
-  "name": "Gaseosa",
-  "price": 1500.00,
-  "stock": 10,
-  "category_id": 1,
-  "provider_id": 2,
-  "barcode": "7790000000000",
-  "cost_price": 900.00
-}
-```
-
-### Categorias
-
-| Metodo | Ruta | Autenticacion | Descripcion |
-| --- | --- | --- | --- |
-| `GET` | `/categories` | No | Lista categorias. |
-| `POST` | `/categories` | No | Crea una categoria. |
-| `GET` | `/categories/{id}` | No | Obtiene una categoria. |
-| `PUT` | `/categories/{id}` | No | Actualiza una categoria. |
-| `DELETE` | `/categories/{id}` | No | Elimina una categoria. |
-
-Payload de creacion o actualizacion:
-
-```json
-{
-  "name": "Bebidas"
-}
-```
-
-### Proveedores
-
-| Metodo | Ruta | Autenticacion | Descripcion |
-| --- | --- | --- | --- |
-| `GET` | `/providers` | No | Lista proveedores. |
-| `POST` | `/providers` | No | Crea un proveedor. |
-| `GET` | `/providers/{id}` | No | Obtiene un proveedor. |
-| `PUT` | `/providers/{id}` | No | Actualiza un proveedor. |
-| `DELETE` | `/providers/{id}` | No | Elimina un proveedor. |
-
-Payload de creacion:
-
-```json
-{
-  "name": "Distribuidora Central",
-  "phone": "555-0100",
-  "direction": "Av. Principal 123"
-}
-```
+Todas las rutas siguientes usan el prefijo `/api`.
 
 ### Usuarios
 
-Estos endpoints requieren un JWT valido con rol `Administrador`:
+| Metodo | Ruta | Acceso |
+| --- | --- | --- |
+| `GET` | `/auth/users` | Administrador |
+| `POST` | `/auth/users` | Administrador |
+| `PUT` | `/auth/users/:id` | Administrador |
+| `DELETE` | `/auth/users/:id` | Administrador |
 
-| Metodo | Ruta | Autenticacion | Descripcion |
-| --- | --- | --- | --- |
-| `GET` | `/users` | Bearer JWT + Administrador | Lista usuarios. |
-| `DELETE` | `/users/{id}` | Bearer JWT + Administrador | Elimina un usuario. |
+Tambien existen los aliases `/users` y `/users/:id`.
 
-Header requerido:
+No se puede eliminar la propia cuenta, degradar o eliminar al ultimo administrador, ni eliminar usuarios con operaciones asociadas.
 
-```http
-Authorization: Bearer <jwt>
+### Catalogos e inventario
+
+| Metodo | Ruta | Acceso |
+| --- | --- | --- |
+| `GET` | `/categories` | Auth |
+| `POST` | `/categories` | Administrador |
+| `GET` | `/categories/:id` | Auth |
+| `PUT` | `/categories/:id` | Administrador |
+| `DELETE` | `/categories/:id` | Administrador |
+| `GET` | `/products` | Auth |
+| `GET` | `/products/barcode/:barcode` | Auth |
+| `POST` | `/products` | Administrador |
+| `GET` | `/products/:id` | Auth |
+| `PUT` | `/products/:id` | Administrador |
+| `DELETE` | `/products/:id` | Administrador |
+| `GET` | `/providers` | Auth |
+| `POST` | `/providers` | Administrador |
+| `GET` | `/providers/:id` | Auth |
+| `PUT` | `/providers/:id` | Administrador |
+| `DELETE` | `/providers/:id` | Administrador |
+
+Los productos incluyen `category` y `provider` cuando existen. Los precios y el stock no pueden ser negativos, el barcode es unico y cada detalle de venta conserva precio y costo historicos.
+
+### Ventas
+
+| Metodo | Ruta | Acceso |
+| --- | --- | --- |
+| `POST` | `/sales` | Auth |
+| `GET` | `/sales/stats` | Auth |
+| `GET` | `/sales/history` | Auth |
+| `GET` | `/sales/:id` | Auth |
+| `PATCH` | `/sales/:id/anular` | Administrador |
+| `PUT` | `/sales/:id/anular` | Administrador |
+
+Body de creacion:
+
+```json
+{
+  "customer_id": 1,
+  "products": [{"product_id": 1, "quantity": 2}],
+  "payment_method": "Efectivo",
+  "discount_amount": 0
+}
 ```
 
-Las sesiones JWT expiran despues de 24 horas.
+Medios validos: `Efectivo`, `Debito`, `Cuenta corriente`, `Transferencia` y `Tarjeta de credito`. La venta valida stock y credito dentro de una transaccion, descuenta inventario y actualiza caja cuando corresponde.
 
-## Base de datos
+### Clientes y cuentas corrientes
 
-La aplicacion usa un pool PostgreSQL de hasta 5 conexiones. Las consultas actuales esperan, como minimo, las siguientes tablas:
+| Metodo | Ruta | Acceso |
+| --- | --- | --- |
+| `GET` | `/customers` | Auth |
+| `GET` | `/customers/search?term=juan` | Auth |
+| `POST` | `/customers` | Auth |
+| `GET` | `/customers/:id` | Auth |
+| `PUT` | `/customers/:id` | Auth |
+| `POST` | `/customer-accounts/payment` | Auth |
+| `GET` | `/customer-accounts/balance/:id` | Auth |
+| `GET` | `/customer-accounts/history/:id` | Auth |
 
-- `users`
-- `categories`
-- `products`
-- `providers`
+Los cobros en efectivo requieren turno abierto y actualizan `expected_cash`. `creditMax` no puede ser negativo y el DNI es unico cuando se informa.
 
-Las consultas tambien esperan:
+### Caja
 
-- Un tipo PostgreSQL llamado `enum_users_role`.
-- Columnas camelCase con comillas: `"createdAt"` y `"updatedAt"`.
-- Relaciones entre productos, categorias y proveedores mediante `category_id` y `provider_id`.
+| Metodo | Ruta | Acceso |
+| --- | --- | --- |
+| `POST` | `/cash-shifts/open` | Auth |
+| `GET` | `/cash-shifts/current` | Auth |
+| `POST` | `/cash-shifts/close` | Auth |
+| `GET` | `/cash-shifts/history` | Administrador |
 
-El esquema exacto, las restricciones, los indices y las migraciones no estan incluidos en este repositorio.
+La caja registra fondo inicial, efectivo esperado, efectivo contado, diferencia, ventas, gastos y movimientos asociados.
 
-## Estructura del proyecto
+### Gastos
+
+| Metodo | Ruta | Acceso |
+| --- | --- | --- |
+| `GET` | `/expenses?from=YYYY-MM-DD&to=YYYY-MM-DD` | Auth |
+| `POST` | `/expenses` | Auth |
+| `GET` | `/expenses/summary?from=YYYY-MM-DD&to=YYYY-MM-DD` | Auth |
+| `DELETE` | `/expenses/:id` | Administrador |
+
+Categorias: `Estructura`, `Herramientas`, `Personal`, `Marketing`. Los gastos en efectivo requieren un turno abierto y descuentan el efectivo esperado.
+
+### Compras y cuentas de proveedores
+
+| Metodo | Ruta | Acceso |
+| --- | --- | --- |
+| `GET` | `/purchases?from=YYYY-MM-DD&to=YYYY-MM-DD` | Auth |
+| `POST` | `/purchases` | Administrador |
+| `GET` | `/purchases/:id` | Auth |
+| `POST` | `/purchases/:id/anular` | Administrador |
+| `GET` | `/provider-accounts/balance/:id` | Administrador |
+| `POST` | `/provider-accounts/payment` | Administrador |
+
+Las compras actualizan stock y costo promedio ponderado. Las compras a cuenta corriente generan deuda. Los pagos en efectivo requieren turno abierto y saldo suficiente.
+
+### Reportes
+
+Todas las rutas de reportes requieren administrador:
+
+| Metodo | Ruta |
+| --- | --- |
+| `GET` | `/reports/sales-summary?from=...&to=...` |
+| `GET` | `/reports/top-products?from=...&to=...` |
+| `GET` | `/reports/sales-by-user?from=...&to=...` |
+| `GET` | `/reports/financial-compliance` |
+| `GET` | `/reports/financial-dashboard?from=...&to=...` |
+
+Las fechas usan formato `YYYY-MM-DD` y un rango invertido devuelve `400`.
+
+## Auditoria y seguridad
+
+Las escrituras exitosas (`POST`, `PUT`, `PATCH`, `DELETE`) se registran en `audit_logs` con metodo, ruta, usuario, entidad y payload. Los campos `password` y `token` se eliminan antes de persistir el payload.
+
+Las contrasenas se almacenan con Argon2. La identidad de las operaciones financieras sale del JWT; el cliente no debe enviar `user_id` para decidir quien realizo una operacion.
+
+## Estructura
 
 ```text
 src/
-├── main.rs                 # Arranque del servidor y composicion de rutas
-├── db.rs                   # Conexion y pool PostgreSQL
-├── auth.rs                 # Hash de contrasenas y JWT
-├── errors.rs               # Errores HTTP de la aplicacion
-├── extractors.rs           # Extractores AuthUser y AdminUser
-├── middleware/
-│   ├── mod.rs
-│   └── auth.rs              # Validacion del header Bearer
+├── main.rs
+├── db.rs
+├── auth.rs
+├── errors.rs
+├── extractors.rs
 ├── handlers/
 │   ├── auth.rs
 │   ├── categories.rs
+│   ├── financial.rs
 │   ├── health.rs
 │   ├── products.rs
 │   ├── providers.rs
 │   └── users.rs
+├── middleware/
+│   ├── auth.rs
+│   └── audit.rs
 ├── models/
-│   ├── category.rs
-│   ├── product.rs
-│   ├── provider.rs
-│   └── user.rs
 └── routes/
-    └── mod.rs              # Definicion de rutas HTTP
 ```
 
-## Seguridad y limitaciones actuales
+## Estado de validacion
 
-- El registro permite que el cliente envie el rol, incluido `Administrador`. En produccion deberia restringirse la creacion de administradores.
-- Productos, categorias y proveedores estan expuestos sin autenticacion, incluyendo operaciones de escritura y eliminacion.
-- El middleware JWT protege los endpoints de usuarios.
-- El secreto JWT debe ser largo, privado y diferente entre entornos.
-- No hay migraciones ni pruebas de integracion incluidas.
-- Los errores de base de datos se registran en logs y se devuelven como error interno al cliente.
+El proyecto pasa:
 
-## Estado del proyecto
-
-Comprobaciones locales previstas:
-
-```powershell
+```text
+cargo fmt --check
 cargo check
 cargo test
-cargo fmt --check
 ```
 
-La aplicacion requiere una instancia PostgreSQL configurada para probar los endpoints que acceden a la base de datos.
+La validacion realizada no reemplaza una prueba de integracion contra PostgreSQL. Para probar los endpoints, carga `kiosco_flow.sql`, configura `.env` y ejecuta `cargo run`.

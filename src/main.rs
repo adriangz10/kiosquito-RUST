@@ -7,8 +7,13 @@ mod middleware;
 mod models;
 mod routes;
 
-use axum::{routing::get, Router};
+use axum::{
+    http::{header, HeaderValue, Method},
+    routing::get,
+    Router,
+};
 use std::net::SocketAddr;
+use tower_http::cors::CorsLayer;
 
 #[tokio::main]
 async fn main() {
@@ -19,11 +24,29 @@ async fn main() {
 
     let app = Router::new()
         .route("/health", get(handlers::health::check))
-        .merge(routes::products_routes())
-        .merge(routes::categories_routes())
-        .merge(routes::providers_routes())
-        .merge(routes::auth_routes())
-        .merge(routes::users_routes())
+        .merge(routes::api_routes())
+        .layer(axum::middleware::from_fn_with_state(
+            pool.clone(),
+            middleware::audit::audit,
+        ))
+        .layer(
+            CorsLayer::new()
+                .allow_origin(
+                    std::env::var("FRONTEND_URL")
+                        .unwrap_or_else(|_| "http://localhost:5173".to_string())
+                        .parse::<HeaderValue>()
+                        .expect("FRONTEND_URL inválida"),
+                )
+                .allow_methods([
+                    Method::GET,
+                    Method::POST,
+                    Method::PUT,
+                    Method::PATCH,
+                    Method::DELETE,
+                ])
+                .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+                .allow_credentials(true),
+        )
         .with_state(pool);
 
     let port: u16 = std::env::var("PORT")

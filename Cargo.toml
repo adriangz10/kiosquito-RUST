@@ -14,6 +14,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower-http = { version = "0.7.1", features = ["cors", "trace"] }
 chrono = { version = "0.4", features = ["serde"] }
-rust_decimal = { version = "1", features = ["db-postgres", "serde"] }
+rust_decimal = { version = "1", features = ["db-postgres", "serde", "serde-with-float"] }
 argon2 = "0.6.0"
 jsonwebtoken = { version = "11.1.0", default-features = false, features = ["rust_crypto"] }
+bcrypt = "0.19.3"

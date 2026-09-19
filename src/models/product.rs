@@ -12,7 +12,7 @@ pub struct Product {
     pub category_id: i32,
     pub provider_id: Option<i32>,
     pub barcode: Option<String>,
-    pub cost_price: Decimal,
+    pub cost_price: Option<Decimal>,
     #[serde(rename = "createdAt")]
     #[sqlx(rename = "createdAt")]
     pub created_at: DateTime<Utc>,
@@ -29,7 +29,7 @@ pub struct CreateProduct {
     pub category_id: i32,
     pub provider_id: Option<i32>,
     pub barcode: Option<String>,
-    pub cost_price: Decimal,
+    pub cost_price: Option<Decimal>,
 }
 
 #[derive(Debug, Deserialize)]
