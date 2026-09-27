@@ -73,7 +73,7 @@ pub async fn login(
     }
 
     let user = sqlx::query_as::<_, User>(
-        r#"SELECT id, username, role, password, "createdAt", "updatedAt"
+        r#"SELECT id, username, role, password, pin_supervisor, "createdAt", "updatedAt"
            FROM users WHERE username = $1"#,
     )
     .bind(&payload.username)

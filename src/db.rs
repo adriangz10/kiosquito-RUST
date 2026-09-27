@@ -11,6 +11,8 @@ pub async fn connect() -> PgPool {
         .await
         .expect("No se pudo conectar a la base de datos");
 
+    run_migrations(&pool).await;
+
     sqlx::query(
         r#"INSERT INTO customers (id, name, "creditMax", allow_credit, "createdAt", "updatedAt")
            VALUES (1, 'Consumidor Final', 0, false, now(), now())
@@ -42,8 +44,6 @@ pub async fn connect() -> PgPool {
         sqlx::query("INSERT INTO users (username,role,password,\"createdAt\",\"updatedAt\") VALUES ($1,'Administrador',$2,now(),now())")
             .bind(admin_user).bind(hashed).execute(&pool).await.expect("No se pudo crear el administrador inicial");
     }
-
-    run_migrations(&pool).await;
 
     pool
 }
