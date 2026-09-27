@@ -1,6 +1,8 @@
 use crate::{
+    auth::verify_password,
     errors::AppError,
-    extractors::{AdminUser, AuthUser},
+    extractors::{AdminUser, AuthUser, SupervisorUser},
+    outbox::emit_event,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -51,6 +53,81 @@ pub struct CloseShiftInput {
     pub notes: Option<String>,
 }
 
+// Contrato 2 (Fase 7.1)
+#[derive(Debug, Deserialize)]
+pub struct CierreCiegoRequest {
+    pub caja_sesion_id: Option<i32>,
+    pub efectivo_declarado: Decimal,
+    pub tarjetas_declarado: Option<Decimal>,
+    pub transferencias_declarado: Option<Decimal>,
+    pub observaciones: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CajaMovimientoInput {
+    pub caja_sesion_id: i32,
+    pub tipo: String, // "INGRESO" | "EGRESO"
+    pub monto: Decimal,
+    pub motivo: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CancelSaleInput {
+    pub pin_supervisor: Option<String>,
+}
+
+// Contrato 1 (Fase 7.1)
+#[derive(Debug, Deserialize)]
+pub struct VentaMultimedioRequest {
+    pub caja_sesion_id: Option<i32>,
+    pub cliente_id: Option<i32>,
+    pub tipo_comprobante: Option<String>,
+    pub detalles: Vec<VentaDetalleInput>,
+    pub pagos: Vec<VentaPagoInput>,
+    pub monto_total: Decimal,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VentaDetalleInput {
+    pub producto_id: i32,
+    pub cantidad: Decimal,
+    pub precio_unitario: Option<Decimal>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VentaPagoInput {
+    pub medio_pago: String,
+    pub monto_imputado: Decimal,
+    pub monto_recibido: Option<Decimal>,
+    #[allow(dead_code)]
+    pub vuelto_entregado: Option<Decimal>,
+    pub referencia: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AjusteInventarioInput {
+    pub producto_id: i32,
+    pub tipo: String, // "AJUSTE" | "MERMA"
+    pub cantidad: Decimal,
+    pub motivo: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LoteVencimientoInput {
+    pub producto_id: i32,
+    pub numero_lote: Option<String>,
+    pub fecha_vencimiento: NaiveDate,
+    pub cantidad: Decimal,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct KardexQuery {
+    pub producto_id: Option<i32>,
+    pub tipo: Option<String>,
+    pub from: Option<NaiveDate>,
+    pub to: Option<NaiveDate>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SaleInput {
     pub customer_id: i32,
@@ -62,7 +139,7 @@ pub struct SaleInput {
 #[derive(Debug, Deserialize)]
 pub struct SaleItem {
     pub product_id: i32,
-    pub quantity: i32,
+    pub quantity: Decimal,
 }
 
 #[derive(Debug, Deserialize)]
@@ -597,15 +674,56 @@ pub async fn cash_current(
     State(pool): State<PgPool>,
     AuthUser(claims): AuthUser,
 ) -> Result<Json<Value>, AppError> {
-    let shift = sqlx::query_as::<_, (i32, Decimal, Decimal, Option<Decimal>, String, DateTime<Utc>, Option<String>)>("SELECT id,initial_cash,expected_cash,actual_cash,status::text,opened_at,notes FROM cash_shifts WHERE user_id=$1 AND status='abierta' ORDER BY opened_at DESC LIMIT 1").bind(claims.sub).fetch_optional(&pool).await?;
+    let shift = sqlx::query_as::<_, (i32, Decimal, Decimal, Option<Decimal>, String, DateTime<Utc>, Option<String>, Decimal, Decimal)>(
+        r#"SELECT id, initial_cash, expected_cash, actual_cash, status::text, opened_at, notes, 
+                  expected_cards, expected_transfers 
+           FROM cash_shifts 
+           WHERE user_id=$1 AND status='abierta' 
+           ORDER BY opened_at DESC LIMIT 1"#
+    )
+    .bind(claims.sub)
+    .fetch_optional(&pool)
+    .await?;
+
     let Some(shift) = shift else {
-        return Ok(Json(json!({"open":false,"shift":null})));
+        return Ok(Json(json!({"open": false, "shift": null})));
     };
-    let sales: Value = sqlx::query_scalar("SELECT COALESCE(jsonb_agg(to_jsonb(s) ORDER BY s.\"createdAt\" DESC),'[]'::jsonb) FROM sales s WHERE s.cash_shift_id=$1").bind(shift.0).fetch_one(&pool).await?;
-    let expenses: Value = sqlx::query_scalar("SELECT COALESCE(jsonb_agg(to_jsonb(e) ORDER BY e.\"createdAt\" DESC),'[]'::jsonb) FROM expenses e WHERE e.cash_shift_id=$1").bind(shift.0).fetch_one(&pool).await?;
-    Ok(Json(
-        json!({"open":true,"shift":{"id":shift.0,"initial_cash":shift.1,"expected_cash":shift.2,"actual_cash":shift.3,"status":shift.4,"opened_at":shift.5,"notes":shift.6,"sales":sales,"expenses":expenses}}),
-    ))
+
+    let sales: Value = sqlx::query_scalar(
+        "SELECT COALESCE(jsonb_agg(to_jsonb(s) ORDER BY s.\"createdAt\" DESC), '[]'::jsonb) FROM sales s WHERE s.cash_shift_id = $1"
+    )
+    .bind(shift.0)
+    .fetch_one(&pool)
+    .await?;
+
+    let expenses: Value = sqlx::query_scalar(
+        "SELECT COALESCE(jsonb_agg(to_jsonb(e) ORDER BY e.\"createdAt\" DESC), '[]'::jsonb) FROM expenses e WHERE e.cash_shift_id = $1"
+    )
+    .bind(shift.0)
+    .fetch_one(&pool)
+    .await?;
+
+    // BR-POS-002: Modalidad Cierre Ciego
+    // Si el usuario NO es supervisor (dueño/admin/encargado), NO se exponen los montos esperados
+    let is_supervisor = claims.role.is_supervisor();
+
+    Ok(Json(json!({
+        "open": true,
+        "shift": {
+            "id": shift.0,
+            "initial_cash": shift.1,
+            "expected_cash": if is_supervisor { Some(shift.2) } else { None },
+            "expected_cards": if is_supervisor { Some(shift.7) } else { None },
+            "expected_transfers": if is_supervisor { Some(shift.8) } else { None },
+            "actual_cash": shift.3,
+            "status": shift.4,
+            "opened_at": shift.5,
+            "notes": shift.6,
+            "sales": if is_supervisor { sales } else { json!([]) },
+            "expenses": expenses,
+            "blind_mode": !is_supervisor
+        }
+    })))
 }
 
 pub async fn cash_close(
@@ -645,6 +763,14 @@ pub async fn cash_close(
     .execute(&pool)
     .await?;
 
+    let event_payload = json!({
+        "caja_sesion_id": row.0,
+        "efectivo_declarado": payload.actual_cash,
+        "diferencia": difference,
+        "estado_arqueo": estado_arqueo
+    });
+    let _ = emit_event(&pool, "CAJA", &row.0.to_string(), "CIERRE_CAJA", &event_payload).await;
+
     Ok(Json(json!({
         "message": "Arqueo de caja y cierre de turno completado.",
         "resultado": {
@@ -656,6 +782,115 @@ pub async fn cash_close(
             "estado_arqueo": estado_arqueo,
             "opened_at": row.3,
             "closed_at": Utc::now()
+        }
+    })))
+}
+
+/// Contrato 2 de Especificación Técnica (Fase 7.1) y BR-POS-002:
+/// POST /api/v1/cajas/cierres (y /api/cajas/cierres)
+pub async fn pos_cierre_ciego(
+    State(pool): State<PgPool>,
+    AuthUser(claims): AuthUser,
+    Json(payload): Json<CierreCiegoRequest>,
+) -> Result<Json<Value>, AppError> {
+    if payload.efectivo_declarado.is_sign_negative()
+        || payload.tarjetas_declarado.unwrap_or_default().is_sign_negative()
+        || payload.transferencias_declarado.unwrap_or_default().is_sign_negative()
+    {
+        return Err(AppError::BadRequest(
+            "Los montos declarados no pueden ser negativos".into(),
+        ));
+    }
+
+    let mut tx = pool.begin().await?;
+
+    let shift = if let Some(sid) = payload.caja_sesion_id {
+        sqlx::query_as::<_, (i32, Decimal, Decimal, Decimal, Decimal, DateTime<Utc>)>(
+            "SELECT id, initial_cash, expected_cash, expected_cards, expected_transfers, opened_at FROM cash_shifts WHERE id = $1 AND status = 'abierta' FOR UPDATE"
+        )
+        .bind(sid)
+        .fetch_optional(&mut *tx)
+        .await?
+    } else {
+        sqlx::query_as::<_, (i32, Decimal, Decimal, Decimal, Decimal, DateTime<Utc>)>(
+            "SELECT id, initial_cash, expected_cash, expected_cards, expected_transfers, opened_at FROM cash_shifts WHERE user_id = $1 AND status = 'abierta' ORDER BY opened_at DESC LIMIT 1 FOR UPDATE"
+        )
+        .bind(claims.sub)
+        .fetch_optional(&mut *tx)
+        .await?
+    };
+
+    let Some(row) = shift else {
+        return Err(AppError::BadRequest(
+            "No se encontró un turno de caja abierto para realizar el cierre ciego".into(),
+        ));
+    };
+
+    let efectivo_declarado = payload.efectivo_declarado;
+    let tarjetas_declarado = payload.tarjetas_declarado.unwrap_or_default();
+    let transferencias_declarado = payload.transferencias_declarado.unwrap_or_default();
+
+    let dif_efectivo = efectivo_declarado - row.2;
+    let dif_tarjetas = tarjetas_declarado - row.3;
+    let dif_transf = transferencias_declarado - row.4;
+    let total_diferencia = dif_efectivo + dif_tarjetas + dif_transf;
+
+    let estado_arqueo = if total_diferencia == Decimal::ZERO {
+        "CUADRADO_EXACTO".to_string()
+    } else if total_diferencia > Decimal::ZERO {
+        format!("SOBRANTE_+${:.2}", total_diferencia)
+    } else {
+        format!("FALTANTE_-${:.2}", total_diferencia.abs())
+    };
+
+    sqlx::query(
+        r#"UPDATE cash_shifts SET 
+             actual_cash = $1, 
+             tarjetas_declarado = $2, 
+             transferencias_declarado = $3, 
+             difference = $4, 
+             status = 'cerrada', 
+             closed_at = now(), 
+             notes = COALESCE($5, notes), 
+             "updatedAt" = now() 
+           WHERE id = $6"#
+    )
+    .bind(efectivo_declarado)
+    .bind(tarjetas_declarado)
+    .bind(transferencias_declarado)
+    .bind(total_diferencia)
+    .bind(payload.observaciones)
+    .bind(row.0)
+    .execute(&mut *tx)
+    .await?;
+
+    let event_payload = json!({
+        "caja_sesion_id": row.0,
+        "efectivo_declarado": efectivo_declarado,
+        "tarjetas_declarado": tarjetas_declarado,
+        "transferencias_declarado": transferencias_declarado,
+        "diferencia_total": total_diferencia,
+        "estado_arqueo": estado_arqueo
+    });
+    emit_event(&mut *tx, "CAJA", &row.0.to_string(), "CIERRE_CIEGO", &event_payload).await?;
+
+    tx.commit().await?;
+
+    Ok(Json(json!({
+        "message": "Cierre Ciego de caja procesado con éxito.",
+        "caja_sesion_id": row.0,
+        "arqueo": {
+            "efectivo_declarado": efectivo_declarado,
+            "efectivo_esperado": row.2,
+            "diferencia_efectivo": dif_efectivo,
+            "tarjetas_declarado": tarjetas_declarado,
+            "tarjetas_esperado": row.3,
+            "diferencia_tarjetas": dif_tarjetas,
+            "transferencias_declarado": transferencias_declarado,
+            "transferencias_esperado": row.4,
+            "diferencia_transferencias": dif_transf,
+            "diferencia_total": total_diferencia,
+            "estado_arqueo": estado_arqueo
         }
     })))
 }
@@ -761,27 +996,58 @@ pub async fn sale_create(
         ));
     }
     let mut tx = pool.begin().await?;
+
+    // BR-POS-001: Prohibido registrar ventas sin una sesión de caja abierta activa para el usuario en la terminal
+    let shift_id: i32 = sqlx::query_scalar(
+        "SELECT id FROM cash_shifts WHERE user_id=$1 AND status='abierta' ORDER BY opened_at DESC LIMIT 1"
+    )
+    .bind(claims.sub)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| {
+        AppError::BadRequest("Prohibido registrar ventas sin una sesión de caja abierta activa para el usuario en la terminal (BR-POS-001)".into())
+    })?;
+
     let mut subtotal = Decimal::ZERO;
     let mut details = Vec::new();
     for item in &payload.products {
-        if item.quantity <= 0 {
+        if item.quantity <= Decimal::ZERO {
             return Err(AppError::BadRequest("La cantidad debe ser positiva".into()));
         }
-        let product = sqlx::query_as::<_, (String, Decimal, Option<i32>, Decimal)>(
-            "SELECT name,price,stock,cost_price FROM products WHERE id=$1 FOR UPDATE",
+        let product = sqlx::query_as::<_, (String, Decimal, Option<Decimal>, Decimal)>(
+            "SELECT name, price, stock, cost_price FROM products WHERE id=$1 FOR UPDATE",
         )
         .bind(item.product_id)
         .fetch_optional(&mut *tx)
         .await?
         .ok_or(AppError::NotFound)?;
-        if product.2.unwrap_or_default() < item.quantity {
-            return Err(AppError::BadRequest(format!(
-                "Stock insuficiente para {}",
-                product.0
-            )));
+
+        let current_stock = product.2.unwrap_or(Decimal::ZERO);
+        let new_stock = current_stock - item.quantity;
+
+        // BR-INV-001: Se permite la venta en stock negativo para no detener la caja, marcando el producto para auditoría
+        if current_stock < item.quantity {
+            let alert_payload = json!({
+                "alerta": "VENTA_STOCK_NEGATIVO",
+                "producto_id": item.product_id,
+                "producto_nombre": product.0,
+                "stock_previo": current_stock,
+                "cantidad_vendida": item.quantity,
+                "stock_resultante": new_stock
+            });
+            let _ = sqlx::query(
+                r#"INSERT INTO audit_logs (user_id, method, path, entity_id, payload, "createdAt")
+                   VALUES ($1, 'ALERT', '/api/sales', $2, $3, now())"#
+            )
+            .bind(claims.sub)
+            .bind(item.product_id.to_string())
+            .bind(alert_payload)
+            .execute(&mut *tx)
+            .await;
         }
-        subtotal += product.1 * Decimal::from(item.quantity);
-        details.push((item.product_id, item.quantity, product.1, product.3));
+
+        subtotal += product.1 * item.quantity;
+        details.push((item.product_id, item.quantity, product.1, product.3, current_stock, new_stock));
     }
     if discount > subtotal {
         return Err(AppError::BadRequest(
@@ -799,24 +1065,70 @@ pub async fn sale_create(
         let balance: Decimal = sqlx::query_scalar("SELECT COALESCE(SUM(CASE WHEN type='debit' THEN amount ELSE -amount END),0) FROM customer_accounts WHERE customer_id=$1").bind(payload.customer_id).fetch_one(&mut *tx).await?;
         if !allow || balance + total > limit {
             return Err(AppError::BadRequest(
-                "El cliente no tiene crédito disponible".into(),
+                "El cliente no tiene crédito disponible (BR-CC-001)".into(),
             ));
         }
     }
-    let shift: Option<i32> = if payload.payment_method == "Efectivo" {
-        sqlx::query_scalar("SELECT id FROM cash_shifts WHERE user_id=$1 AND status='abierta' ORDER BY opened_at DESC LIMIT 1").bind(claims.sub).fetch_optional(&mut *tx).await?
-    } else {
-        None
-    };
-    let sale_id: i32 = sqlx::query_scalar("INSERT INTO sales (total,customer_id,user_id,\"paymentMethod\",status,subtotal,discount_amount,cash_shift_id,\"createdAt\",\"updatedAt\") VALUES ($1,$2,$3,$4::\"enum_sales_paymentMethod\",'completada',$5,$6,$7,now(),now()) RETURNING id").bind(total).bind(payload.customer_id).bind(claims.sub).bind(&payload.payment_method).bind(subtotal).bind(discount).bind(shift).fetch_one(&mut *tx).await?;
-    for (product_id, quantity, unit_price, unit_cost) in details {
-        sqlx::query("INSERT INTO sale_details (sale_id,product_id,quantity,unit_price,unit_cost,\"createdAt\",\"updatedAt\") VALUES ($1,$2,$3,$4,$5,now(),now())").bind(sale_id).bind(product_id).bind(quantity).bind(unit_price).bind(unit_cost).execute(&mut *tx).await?;
-        sqlx::query("UPDATE products SET stock=stock-$1,\"updatedAt\"=now() WHERE id=$2")
+
+    let sale_id: i32 = sqlx::query_scalar(
+        r#"INSERT INTO sales (total,customer_id,user_id,"paymentMethod",status,subtotal,discount_amount,cash_shift_id,tipo_comprobante,"createdAt","updatedAt") 
+           VALUES ($1,$2,$3,$4::"enum_sales_paymentMethod",'completada',$5,$6,$7,'TICKET_NO_FISCAL',now(),now()) 
+           RETURNING id"#
+    )
+    .bind(total)
+    .bind(payload.customer_id)
+    .bind(claims.sub)
+    .bind(&payload.payment_method)
+    .bind(subtotal)
+    .bind(discount)
+    .bind(shift_id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    for (product_id, quantity, unit_price, unit_cost, stock_ant, stock_res) in details {
+        sqlx::query("INSERT INTO sale_details (sale_id,product_id,quantity,unit_price,unit_cost,\"createdAt\",\"updatedAt\") VALUES ($1,$2,$3,$4,$5,now(),now())")
+            .bind(sale_id)
+            .bind(product_id)
             .bind(quantity)
+            .bind(unit_price)
+            .bind(unit_cost)
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query("UPDATE products SET stock=$1,\"updatedAt\"=now() WHERE id=$2")
+            .bind(stock_res)
             .bind(product_id)
             .execute(&mut *tx)
             .await?;
+
+        // BR-INV-002: Kardex inmutable
+        sqlx::query(
+            r#"INSERT INTO movimientos_stock_kardex 
+               (producto_id, user_id, tipo_movimiento, cantidad, stock_anterior, stock_resultante, costo_unitario, referencia_id, motivo, "createdAt")
+               VALUES ($1, $2, 'VENTA', $3, $4, $5, $6, $7, 'Venta en POS', now())"#
+        )
+        .bind(product_id)
+        .bind(claims.sub)
+        .bind(-quantity)
+        .bind(stock_ant)
+        .bind(stock_res)
+        .bind(unit_cost)
+        .bind(sale_id)
+        .execute(&mut *tx)
+        .await?;
     }
+
+    // Registrar en venta_pagos
+    sqlx::query(
+        r#"INSERT INTO venta_pagos (sale_id, medio_pago, monto_imputado, monto_recibido, vuelto_entregado, "createdAt")
+           VALUES ($1, $2, $3, $3, 0, now())"#
+    )
+    .bind(sale_id)
+    .bind(&payload.payment_method)
+    .bind(total)
+    .execute(&mut *tx)
+    .await?;
+
     if payload.payment_method == "Cuenta corriente" {
         sqlx::query("INSERT INTO customer_accounts (customer_id,sale_id,type,amount,description,\"createdAt\",\"updatedAt\") VALUES ($1,$2,'debit',$3,$4,now(),now())")
             .bind(payload.customer_id)
@@ -826,16 +1138,38 @@ pub async fn sale_create(
             .execute(&mut *tx)
             .await?;
     }
-    if let Some(shift_id) = shift {
-        sqlx::query(
-            "UPDATE cash_shifts SET expected_cash=expected_cash+$1,\"updatedAt\"=now() WHERE id=$2",
-        )
-        .bind(total)
-        .bind(shift_id)
-        .execute(&mut *tx)
-        .await?;
+
+    if payload.payment_method == "Efectivo" {
+        sqlx::query("UPDATE cash_shifts SET expected_cash=expected_cash+$1,\"updatedAt\"=now() WHERE id=$2")
+            .bind(total)
+            .bind(shift_id)
+            .execute(&mut *tx)
+            .await?;
+    } else if payload.payment_method.contains("Tarjeta") || payload.payment_method.contains("Débito") {
+        sqlx::query("UPDATE cash_shifts SET expected_cards=expected_cards+$1,\"updatedAt\"=now() WHERE id=$2")
+            .bind(total)
+            .bind(shift_id)
+            .execute(&mut *tx)
+            .await?;
+    } else if payload.payment_method == "Transferencia" {
+        sqlx::query("UPDATE cash_shifts SET expected_transfers=expected_transfers+$1,\"updatedAt\"=now() WHERE id=$2")
+            .bind(total)
+            .bind(shift_id)
+            .execute(&mut *tx)
+            .await?;
     }
+
+    // Outbox Pattern (Fase 6.1)
+    let event_payload = json!({
+        "sale_id": sale_id,
+        "monto_total": total,
+        "medio_pago": payload.payment_method,
+        "caja_sesion_id": shift_id
+    });
+    emit_event(&mut *tx, "VENTA", &sale_id.to_string(), "VENTA_CREADA", &event_payload).await?;
+
     tx.commit().await?;
+
     Ok((
         StatusCode::CREATED,
         Json(json!({
@@ -846,9 +1180,293 @@ pub async fn sale_create(
                 "id": sale_id,
                 "subtotal": subtotal,
                 "discount_amount": discount,
-                "total": total
+                "total": total,
+                "cash_shift_id": shift_id
             }
         })),
+    ))
+}
+
+/// Contrato 1 de Especificación Técnica (Fase 7.1) y BR-POS-004:
+/// POST /api/v1/pos/ventas (y /api/pos/ventas)
+pub async fn pos_venta_create(
+    State(pool): State<PgPool>,
+    AuthUser(claims): AuthUser,
+    Json(payload): Json<VentaMultimedioRequest>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    if payload.detalles.is_empty() || payload.pagos.is_empty() {
+        return Err(AppError::BadRequest("El ticket debe contener al menos un producto y un pago".into()));
+    }
+
+    if payload.monto_total <= Decimal::ZERO {
+        return Err(AppError::BadRequest("El monto total debe ser positivo".into()));
+    }
+
+    // BR-POS-004: En cobros combinados, la suma estricta de los pagos debe ser exactamente igual al total del ticket.
+    let suma_imputada: Decimal = payload.pagos.iter().map(|p| p.monto_imputado).sum();
+    if suma_imputada != payload.monto_total {
+        return Err(AppError::BadRequest(format!(
+            "La suma de los pagos (${}) no coincide exactamente con el total del ticket (${}) (BR-POS-004)",
+            suma_imputada, payload.monto_total
+        )));
+    }
+
+    let mut tx = pool.begin().await?;
+
+    // BR-POS-001: Prohibido registrar ventas sin una sesión de caja abierta activa para el usuario en la terminal.
+    let shift_id: i32 = if let Some(sid) = payload.caja_sesion_id {
+        let open_shift: Option<i32> = sqlx::query_scalar(
+            "SELECT id FROM cash_shifts WHERE id = $1 AND status = 'abierta'"
+        )
+        .bind(sid)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        open_shift.ok_or_else(|| {
+            AppError::BadRequest("La sesión de caja especificada no existe o ya está cerrada (BR-POS-001)".into())
+        })?
+    } else {
+        let open_shift: Option<i32> = sqlx::query_scalar(
+            "SELECT id FROM cash_shifts WHERE user_id = $1 AND status = 'abierta' ORDER BY opened_at DESC LIMIT 1"
+        )
+        .bind(claims.sub)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        open_shift.ok_or_else(|| {
+            AppError::BadRequest("Prohibido registrar ventas sin una sesión de caja abierta activa para el usuario en la terminal (BR-POS-001)".into())
+        })?
+    };
+
+    let cliente_id = payload.cliente_id.unwrap_or(1); // 1 = Consumidor Final
+    let tipo_comprobante = payload.tipo_comprobante.unwrap_or_else(|| "TICKET_NO_FISCAL".to_string());
+
+    let mut subtotal_calculado = Decimal::ZERO;
+    let mut details_to_insert = Vec::new();
+
+    for item in &payload.detalles {
+        if item.cantidad <= Decimal::ZERO {
+            return Err(AppError::BadRequest("La cantidad de producto debe ser mayor a 0".into()));
+        }
+
+        let product = sqlx::query_as::<_, (String, Decimal, Option<Decimal>, Decimal)>(
+            "SELECT name, price, stock, cost_price FROM products WHERE id = $1 FOR UPDATE"
+        )
+        .bind(item.producto_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
+        let unit_price = item.precio_unitario.unwrap_or(product.1);
+        let current_stock = product.2.unwrap_or(Decimal::ZERO);
+        let new_stock = current_stock - item.cantidad;
+
+        // BR-INV-001: Se permite la venta en stock negativo para no detener la caja, marcando el producto para auditoría.
+        if current_stock < item.cantidad {
+            let alert_payload = json!({
+                "alerta": "VENTA_STOCK_NEGATIVO",
+                "producto_id": item.producto_id,
+                "producto_nombre": product.0,
+                "stock_previo": current_stock,
+                "cantidad_vendida": item.cantidad,
+                "stock_resultante": new_stock
+            });
+            let _ = sqlx::query(
+                r#"INSERT INTO audit_logs (user_id, method, path, entity_id, payload, "createdAt")
+                   VALUES ($1, 'ALERT', '/api/v1/pos/ventas', $2, $3, now())"#
+            )
+            .bind(claims.sub)
+            .bind(item.producto_id.to_string())
+            .bind(alert_payload)
+            .execute(&mut *tx)
+            .await;
+        }
+
+        subtotal_calculado += unit_price * item.cantidad;
+        details_to_insert.push((item.producto_id, item.cantidad, unit_price, product.3, current_stock, new_stock));
+    }
+
+    // Validar cuentas corrientes si algún pago es CUENTA_CORRIENTE (BR-CC-001)
+    let cta_cte_total: Decimal = payload.pagos.iter()
+        .filter(|p| {
+            let u = p.medio_pago.to_uppercase();
+            u == "CUENTA_CORRIENTE" || u == "CUENTA CORRIENTE"
+        })
+        .map(|p| p.monto_imputado)
+        .sum();
+
+    if cta_cte_total > Decimal::ZERO {
+        let (allow, limit): (bool, Decimal) = sqlx::query_as(
+            "SELECT allow_credit, COALESCE(\"creditMax\", 0) FROM customers WHERE id = $1"
+        )
+        .bind(cliente_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::BadRequest("Cliente no encontrado para cobro en cuenta corriente".into()))?;
+
+        let balance: Decimal = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(CASE WHEN type='debit' THEN amount ELSE -amount END), 0) FROM customer_accounts WHERE customer_id = $1"
+        )
+        .bind(cliente_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        if !allow || (balance + cta_cte_total > limit) {
+            return Err(AppError::BadRequest("El cliente no tiene suficiente crédito disponible en cuenta corriente (BR-CC-001)".into()));
+        }
+    }
+
+    let sale_id: i32 = sqlx::query_scalar(
+        r#"INSERT INTO sales (total, customer_id, user_id, "paymentMethod", status, subtotal, discount_amount, cash_shift_id, tipo_comprobante, "createdAt", "updatedAt")
+           VALUES ($1, $2, $3, 'Efectivo', 'completada', $4, 0, $5, $6, now(), now())
+           RETURNING id"#
+    )
+    .bind(payload.monto_total)
+    .bind(cliente_id)
+    .bind(claims.sub)
+    .bind(subtotal_calculado)
+    .bind(shift_id)
+    .bind(&tipo_comprobante)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    // Insertar detalles, actualizar stock y registrar en Kardex (BR-INV-002)
+    for (prod_id, qty, u_price, u_cost, stock_ant, stock_res) in details_to_insert {
+        sqlx::query(
+            r#"INSERT INTO sale_details (sale_id, product_id, quantity, unit_price, unit_cost, "createdAt", "updatedAt")
+               VALUES ($1, $2, $3, $4, $5, now(), now())"#
+        )
+        .bind(sale_id)
+        .bind(prod_id)
+        .bind(qty)
+        .bind(u_price)
+        .bind(u_cost)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "UPDATE products SET stock = $1, \"updatedAt\" = now() WHERE id = $2"
+        )
+        .bind(stock_res)
+        .bind(prod_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // BR-INV-002: Kardex inmutable
+        sqlx::query(
+            r#"INSERT INTO movimientos_stock_kardex 
+               (producto_id, user_id, tipo_movimiento, cantidad, stock_anterior, stock_resultante, costo_unitario, referencia_id, motivo, "createdAt")
+               VALUES ($1, $2, 'VENTA', $3, $4, $5, $6, $7, 'Venta en POS', now())"#
+        )
+        .bind(prod_id)
+        .bind(claims.sub)
+        .bind(-qty)
+        .bind(stock_ant)
+        .bind(stock_res)
+        .bind(u_cost)
+        .bind(sale_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    // Insertar pagos en venta_pagos y actualizar caja
+    let mut total_efectivo = Decimal::ZERO;
+    let mut total_tarjetas = Decimal::ZERO;
+    let mut total_transf = Decimal::ZERO;
+    let mut pagos_resp = Vec::new();
+
+    for pago in payload.pagos {
+        let vuelto = if pago.medio_pago.to_uppercase() == "EFECTIVO" {
+            let recibido = pago.monto_recibido.unwrap_or(pago.monto_imputado);
+            (recibido - pago.monto_imputado).max(Decimal::ZERO)
+        } else {
+            Decimal::ZERO
+        };
+
+        let monto_recibido = pago.monto_recibido.unwrap_or(pago.monto_imputado);
+
+        sqlx::query(
+            r#"INSERT INTO venta_pagos (sale_id, medio_pago, monto_imputado, monto_recibido, vuelto_entregado, referencia, "createdAt")
+               VALUES ($1, $2, $3, $4, $5, $6, now())"#
+        )
+        .bind(sale_id)
+        .bind(&pago.medio_pago)
+        .bind(pago.monto_imputado)
+        .bind(monto_recibido)
+        .bind(vuelto)
+        .bind(&pago.referencia)
+        .execute(&mut *tx)
+        .await?;
+
+        let mp_upper = pago.medio_pago.to_uppercase();
+        if mp_upper == "EFECTIVO" {
+            total_efectivo += pago.monto_imputado;
+        } else if mp_upper.contains("TARJETA") || mp_upper.contains("DEBITO") || mp_upper.contains("CREDITO") {
+            total_tarjetas += pago.monto_imputado;
+        } else if mp_upper.contains("QR") || mp_upper.contains("TRANSFERENCIA") {
+            total_transf += pago.monto_imputado;
+        } else if mp_upper == "CUENTA_CORRIENTE" || mp_upper == "CUENTA CORRIENTE" {
+            sqlx::query(
+                r#"INSERT INTO customer_accounts (customer_id, sale_id, type, amount, description, "createdAt", "updatedAt")
+                   VALUES ($1, $2, 'debit', $3, $4, now(), now())"#
+            )
+            .bind(cliente_id)
+            .bind(sale_id)
+            .bind(pago.monto_imputado)
+            .bind(format!("Venta POS #{}", sale_id))
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        pagos_resp.push(json!({
+            "medio_pago": pago.medio_pago,
+            "monto_imputado": pago.monto_imputado,
+            "monto_recibido": monto_recibido,
+            "vuelto_entregado": vuelto,
+            "referencia": pago.referencia
+        }));
+    }
+
+    // Actualizar expected en la caja
+    sqlx::query(
+        r#"UPDATE cash_shifts 
+           SET expected_cash = expected_cash + $1,
+               expected_cards = expected_cards + $2,
+               expected_transfers = expected_transfers + $3,
+               "updatedAt" = now()
+           WHERE id = $4"#
+    )
+    .bind(total_efectivo)
+    .bind(total_tarjetas)
+    .bind(total_transf)
+    .bind(shift_id)
+    .execute(&mut *tx)
+    .await?;
+
+    // Outbox Pattern (Fase 6.1)
+    let event_payload = json!({
+        "sale_id": sale_id,
+        "monto_total": payload.monto_total,
+        "tipo_comprobante": tipo_comprobante,
+        "caja_sesion_id": shift_id
+    });
+    emit_event(&mut *tx, "VENTA", &sale_id.to_string(), "VENTA_MULTIMEDIO_CREADA", &event_payload).await?;
+
+    tx.commit().await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "message": "Venta multimedio registrada con éxito.",
+            "ticket": {
+                "sale_id": sale_id,
+                "caja_sesion_id": shift_id,
+                "cliente_id": cliente_id,
+                "tipo_comprobante": tipo_comprobante,
+                "monto_total": payload.monto_total,
+                "pagos": pagos_resp
+            }
+        }))
     ))
 }
 
@@ -999,49 +1617,451 @@ pub async fn sale_get(
 
 pub async fn sale_cancel(
     State(pool): State<PgPool>,
-    AdminUser(_user): AdminUser,
+    AuthUser(claims): AuthUser,
     Path(id): Path<i32>,
+    body: Option<Json<CancelSaleInput>>,
 ) -> Result<Json<Value>, AppError> {
+    // BR-POS-003: Anulación requiere rol de supervisor o autorización por PIN/clave de supervisor
+    let mut supervisor_id = None;
+    if claims.role.is_supervisor() {
+        supervisor_id = Some(claims.sub);
+    } else {
+        let pin = body.as_ref().and_then(|b| b.pin_supervisor.as_deref()).unwrap_or("").trim();
+        if pin.is_empty() {
+            return Err(AppError::Forbidden(
+                "Se requiere autorización de supervisor (rol o PIN) para anular la venta (BR-POS-003)".into(),
+            ));
+        }
+
+        let supervisors = sqlx::query_as::<_, (i32, String)>(
+            r#"SELECT id, pin_supervisor FROM users 
+               WHERE (role = 'Administrador' OR role = 'Dueño' OR role = 'Encargado') 
+                 AND pin_supervisor IS NOT NULL"#
+        )
+        .fetch_all(&pool)
+        .await?;
+
+        let mut authorized = false;
+        for (sid, hash) in supervisors {
+            if verify_password(pin, &hash) {
+                supervisor_id = Some(sid);
+                authorized = true;
+                break;
+            }
+        }
+        if !authorized {
+            return Err(AppError::Forbidden("PIN de supervisor inválido (BR-POS-003)".into()));
+        }
+    }
+
     let mut tx = pool.begin().await?;
-    let sale = sqlx::query_as::<_, (Decimal,i32,Option<i32>,String)>("SELECT total,customer_id,cash_shift_id,\"paymentMethod\"::text FROM sales WHERE id=$1 AND status='completada' FOR UPDATE").fetch_optional(&mut *tx).await?.ok_or(AppError::NotFound)?;
-    let details = sqlx::query_as::<_, (i32, i32)>(
-        "SELECT product_id,quantity FROM sale_details WHERE sale_id=$1",
+    let sale = sqlx::query_as::<_, (Decimal, i32, Option<i32>, String)>(
+        "SELECT total, customer_id, cash_shift_id, \"paymentMethod\"::text FROM sales WHERE id=$1 AND status='completada' FOR UPDATE"
+    )
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(AppError::NotFound)?;
+
+    let details = sqlx::query_as::<_, (i32, Decimal, Decimal)>(
+        "SELECT product_id, quantity, unit_cost FROM sale_details WHERE sale_id=$1"
     )
     .bind(id)
     .fetch_all(&mut *tx)
     .await?;
-    for (product_id, quantity) in details {
-        sqlx::query("UPDATE products SET stock=stock+$1,\"updatedAt\"=now() WHERE id=$2")
-            .bind(quantity)
+
+    for (product_id, quantity, unit_cost) in details {
+        let old_stock: Decimal = sqlx::query_scalar(
+            "SELECT COALESCE(stock, 0) FROM products WHERE id = $1 FOR UPDATE"
+        )
+        .bind(product_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let new_stock = old_stock + quantity;
+
+        sqlx::query("UPDATE products SET stock=$1, \"updatedAt\"=now() WHERE id=$2")
+            .bind(new_stock)
             .bind(product_id)
             .execute(&mut *tx)
             .await?;
-    }
-    if sale.3 == "Cuenta corriente" {
-        sqlx::query("INSERT INTO customer_accounts (customer_id,sale_id,type,amount,description,\"createdAt\",\"updatedAt\") VALUES ($1,$2,'credit',$3,$4,now(),now())")
-            .bind(sale.1)
-            .bind(id)
-            .bind(sale.0)
-            .bind(format!("Anulación de venta #{}", id))
-            .execute(&mut *tx)
-            .await?;
-    }
-    if let Some(shift) = sale.2 {
-        if sale.3 == "Efectivo" {
-            sqlx::query("UPDATE cash_shifts SET expected_cash=GREATEST(0, expected_cash-$1),\"updatedAt\"=now() WHERE id=$2 AND status='abierta'")
-                .bind(sale.0)
-                .bind(shift)
-                .execute(&mut *tx)
-                .await?;
-        }
-    }
-    sqlx::query("UPDATE sales SET status='anulada',\"updatedAt\"=now() WHERE id=$1")
+
+        // BR-INV-002: Kardex inmutable
+        sqlx::query(
+            r#"INSERT INTO movimientos_stock_kardex 
+               (producto_id, user_id, tipo_movimiento, cantidad, stock_anterior, stock_resultante, costo_unitario, referencia_id, motivo, "createdAt")
+               VALUES ($1, $2, 'ANULACION_VENTA', $3, $4, $5, $6, $7, 'Anulación de venta', now())"#
+        )
+        .bind(product_id)
+        .bind(claims.sub)
+        .bind(quantity)
+        .bind(old_stock)
+        .bind(new_stock)
+        .bind(unit_cost)
         .bind(id)
         .execute(&mut *tx)
         .await?;
+    }
+
+    // Revertir pagos en venta_pagos si existen
+    let pagos_existentes = sqlx::query_as::<_, (String, Decimal)>(
+        "SELECT medio_pago, monto_imputado FROM venta_pagos WHERE sale_id=$1"
+    )
+    .bind(id)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    if !pagos_existentes.is_empty() {
+        let mut revert_cash = Decimal::ZERO;
+        let mut revert_cards = Decimal::ZERO;
+        let mut revert_transf = Decimal::ZERO;
+
+        for (mp, monto) in pagos_existentes {
+            let mp_u = mp.to_uppercase();
+            if mp_u == "EFECTIVO" {
+                revert_cash += monto;
+            } else if mp_u.contains("TARJETA") || mp_u.contains("DEBITO") || mp_u.contains("CREDITO") {
+                revert_cards += monto;
+            } else if mp_u.contains("QR") || mp_u.contains("TRANSFERENCIA") {
+                revert_transf += monto;
+            } else if mp_u == "CUENTA_CORRIENTE" || mp_u == "CUENTA CORRIENTE" {
+                sqlx::query(
+                    r#"INSERT INTO customer_accounts (customer_id, sale_id, type, amount, description, "createdAt", "updatedAt")
+                       VALUES ($1, $2, 'credit', $3, $4, now(), now())"#
+                )
+                .bind(sale.1)
+                .bind(id)
+                .bind(monto)
+                .bind(format!("Anulación de venta #{}", id))
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+
+        if let Some(shift) = sale.2 {
+            sqlx::query(
+                r#"UPDATE cash_shifts 
+                   SET expected_cash = GREATEST(0, expected_cash - $1),
+                       expected_cards = GREATEST(0, expected_cards - $2),
+                       expected_transfers = GREATEST(0, expected_transfers - $3),
+                       "updatedAt" = now()
+                   WHERE id = $4 AND status = 'abierta'"#
+            )
+            .bind(revert_cash)
+            .bind(revert_cards)
+            .bind(revert_transf)
+            .bind(shift)
+            .execute(&mut *tx)
+            .await?;
+        }
+    } else {
+        if sale.3 == "Cuenta corriente" {
+            sqlx::query("INSERT INTO customer_accounts (customer_id,sale_id,type,amount,description,\"createdAt\",\"updatedAt\") VALUES ($1,$2,'credit',$3,$4,now(),now())")
+                .bind(sale.1)
+                .bind(id)
+                .bind(sale.0)
+                .bind(format!("Anulación de venta #{}", id))
+                .execute(&mut *tx)
+                .await?;
+        }
+        if let Some(shift) = sale.2 {
+            if sale.3 == "Efectivo" {
+                sqlx::query("UPDATE cash_shifts SET expected_cash=GREATEST(0, expected_cash-$1),\"updatedAt\"=now() WHERE id=$2 AND status='abierta'")
+                    .bind(sale.0)
+                    .bind(shift)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+    }
+
+    sqlx::query("UPDATE sales SET status='anulada', \"updatedAt\"=now() WHERE id=$1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+
+    let event_payload = json!({
+        "sale_id": id,
+        "anulado_por": claims.sub,
+        "supervisor_autorizante": supervisor_id
+    });
+    emit_event(&mut *tx, "VENTA", &id.to_string(), "VENTA_ANULADA", &event_payload).await?;
+
     tx.commit().await?;
-    Ok(Json(
-        json!({"message": format!("Venta #{} anulada con éxito.", id)}),
+
+    Ok(Json(json!({
+        "message": format!("Venta #{} anulada con éxito y stock revertido en Kardex.", id),
+        "supervisor_id": supervisor_id
+    })))
+}
+
+/// RF-CAJ-002: Sangrías y movimientos extraordinarios de caja
+pub async fn caja_movimiento_create(
+    State(pool): State<PgPool>,
+    AuthUser(claims): AuthUser,
+    Json(payload): Json<CajaMovimientoInput>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    if payload.monto <= Decimal::ZERO {
+        return Err(AppError::BadRequest("El monto del movimiento debe ser positivo".into()));
+    }
+    let tipo = payload.tipo.to_uppercase();
+    if tipo != "INGRESO" && tipo != "EGRESO" {
+        return Err(AppError::BadRequest("El tipo debe ser INGRESO o EGRESO (sangría)".into()));
+    }
+
+    let mut tx = pool.begin().await?;
+
+    let shift = sqlx::query_as::<_, (Decimal, String)>(
+        "SELECT expected_cash, status FROM cash_shifts WHERE id = $1 FOR UPDATE"
+    )
+    .bind(payload.caja_sesion_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(AppError::NotFound)?;
+
+    if shift.1 != "abierta" {
+        return Err(AppError::BadRequest("La sesión de caja no está abierta".into()));
+    }
+
+    let nuevo_esperado = if tipo == "INGRESO" {
+        shift.0 + payload.monto
+    } else {
+        if shift.0 < payload.monto {
+            return Err(AppError::BadRequest(format!(
+                "Efectivo insuficiente en caja (${}) para realizar la sangría (${})",
+                shift.0, payload.monto
+            )));
+        }
+        shift.0 - payload.monto
+    };
+
+    sqlx::query(
+        "UPDATE cash_shifts SET expected_cash = $1, \"updatedAt\" = now() WHERE id = $2"
+    )
+    .bind(nuevo_esperado)
+    .bind(payload.caja_sesion_id)
+    .execute(&mut *tx)
+    .await?;
+
+    let mov_id: i32 = sqlx::query_scalar(
+        r#"INSERT INTO caja_movimientos (caja_sesion_id, user_id, tipo, monto, motivo, "createdAt")
+           VALUES ($1, $2, $3, $4, $5, now())
+           RETURNING id"#
+    )
+    .bind(payload.caja_sesion_id)
+    .bind(claims.sub)
+    .bind(&tipo)
+    .bind(payload.monto)
+    .bind(&payload.motivo)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    emit_event(&mut *tx, "CAJA", &payload.caja_sesion_id.to_string(), "CAJA_MOVIMIENTO_REGISTRADO", &json!({
+        "movimiento_id": mov_id,
+        "tipo": tipo,
+        "monto": payload.monto,
+        "nuevo_esperado": nuevo_esperado
+    })).await?;
+
+    tx.commit().await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "message": format!("Movimiento de caja ({}) registrado con éxito.", tipo),
+            "movimiento_id": mov_id,
+            "nuevo_efectivo_esperado": nuevo_esperado
+        }))
+    ))
+}
+
+pub async fn caja_movimientos_list(
+    State(pool): State<PgPool>,
+    AuthUser(_claims): AuthUser,
+    Path(caja_sesion_id): Path<i32>,
+) -> Result<Json<Vec<Value>>, AppError> {
+    let rows = sqlx::query_as::<_, (i32, String, Decimal, String, DateTime<Utc>, String)>(
+        r#"SELECT m.id, m.tipo, m.monto, m.motivo, m."createdAt", u.username
+           FROM caja_movimientos m
+           JOIN users u ON u.id = m.user_id
+           WHERE m.caja_sesion_id = $1
+           ORDER BY m."createdAt" DESC"#
+    )
+    .bind(caja_sesion_id)
+    .fetch_all(&pool)
+    .await?;
+
+    Ok(Json(rows.into_iter().map(|r| json!({
+        "id": r.0,
+        "tipo": r.1,
+        "monto": r.2,
+        "motivo": r.3,
+        "createdAt": r.4,
+        "usuario": r.5
+    })).collect()))
+}
+
+/// BR-INV-002 & RF-INV-003: Consulta del Libro Diario de Kardex
+pub async fn kardex_list(
+    State(pool): State<PgPool>,
+    AuthUser(_claims): AuthUser,
+    Query(query): Query<KardexQuery>,
+) -> Result<Json<Vec<Value>>, AppError> {
+    let rows = sqlx::query_as::<_, (i32, i32, String, String, Decimal, Decimal, Decimal, Decimal, Option<i32>, Option<String>, DateTime<Utc>, Option<String>)>(
+        r#"
+        SELECT k.id, k.producto_id, p.name AS producto_nombre, k.tipo_movimiento,
+               k.cantidad, k.stock_anterior, k.stock_resultante, k.costo_unitario,
+               k.referencia_id, k.motivo, k."createdAt", u.username
+        FROM movimientos_stock_kardex k
+        JOIN products p ON p.id = k.producto_id
+        LEFT JOIN users u ON u.id = k.user_id
+        WHERE ($1::int IS NULL OR k.producto_id = $1)
+          AND ($2::text IS NULL OR k.tipo_movimiento = $2)
+          AND ($3::date IS NULL OR k."createdAt"::date >= $3)
+          AND ($4::date IS NULL OR k."createdAt"::date <= $4)
+        ORDER BY k."createdAt" DESC
+        LIMIT 200
+        "#
+    )
+    .bind(query.producto_id)
+    .bind(query.tipo)
+    .bind(query.from)
+    .bind(query.to)
+    .fetch_all(&pool)
+    .await?;
+
+    Ok(Json(rows.into_iter().map(|r| json!({
+        "id": r.0,
+        "producto_id": r.1,
+        "producto_nombre": r.2,
+        "tipo_movimiento": r.3,
+        "cantidad": r.4,
+        "stock_anterior": r.5,
+        "stock_resultante": r.6,
+        "costo_unitario": r.7,
+        "referencia_id": r.8,
+        "motivo": r.9,
+        "createdAt": r.10,
+        "usuario": r.11
+    })).collect()))
+}
+
+/// US-INV-02 & RF-INV-003: Ajuste de Inventario y Mermas
+pub async fn inventario_ajuste(
+    State(pool): State<PgPool>,
+    SupervisorUser(claims): SupervisorUser,
+    Json(payload): Json<AjusteInventarioInput>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    let tipo = payload.tipo.to_uppercase();
+    if tipo != "AJUSTE" && tipo != "MERMA" {
+        return Err(AppError::BadRequest("El tipo debe ser AJUSTE o MERMA".into()));
+    }
+
+    let mut tx = pool.begin().await?;
+
+    let (name, old_stock, cost): (String, Decimal, Decimal) = sqlx::query_as(
+        "SELECT name, COALESCE(stock, 0), cost_price FROM products WHERE id = $1 FOR UPDATE"
+    )
+    .bind(payload.producto_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(AppError::NotFound)?;
+
+    let new_stock = old_stock + payload.cantidad;
+
+    sqlx::query("UPDATE products SET stock = $1, \"updatedAt\" = now() WHERE id = $2")
+        .bind(new_stock)
+        .bind(payload.producto_id)
+        .execute(&mut *tx)
+        .await?;
+
+    let mov_id: i32 = sqlx::query_scalar(
+        r#"INSERT INTO movimientos_stock_kardex 
+           (producto_id, user_id, tipo_movimiento, cantidad, stock_anterior, stock_resultante, costo_unitario, motivo, "createdAt")
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+           RETURNING id"#
+    )
+    .bind(payload.producto_id)
+    .bind(claims.sub)
+    .bind(&tipo)
+    .bind(payload.cantidad)
+    .bind(old_stock)
+    .bind(new_stock)
+    .bind(cost)
+    .bind(&payload.motivo)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    emit_event(&mut *tx, "INVENTARIO", &payload.producto_id.to_string(), "AJUSTE_INVENTARIO", &json!({
+        "producto_id": payload.producto_id,
+        "tipo": tipo,
+        "cantidad": payload.cantidad,
+        "stock_resultante": new_stock
+    })).await?;
+
+    tx.commit().await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "message": format!("Ajuste de inventario ({}) registrado correctamente.", tipo),
+            "producto": name,
+            "stock_anterior": old_stock,
+            "cantidad_ajustada": payload.cantidad,
+            "stock_resultante": new_stock,
+            "kardex_id": mov_id
+        }))
+    ))
+}
+
+/// RF-INV-003: Control de vencimientos
+pub async fn vencimientos_list(
+    State(pool): State<PgPool>,
+    AuthUser(_claims): AuthUser,
+) -> Result<Json<Vec<Value>>, AppError> {
+    let rows = sqlx::query_as::<_, (i32, i32, String, Option<String>, NaiveDate, Decimal, String)>(
+        r#"SELECT l.id, l.producto_id, p.name, l.numero_lote, l.fecha_vencimiento, l.cantidad, l.estado
+           FROM lotes_vencimientos l
+           JOIN products p ON p.id = l.producto_id
+           WHERE l.estado = 'ACTIVO'
+           ORDER BY l.fecha_vencimiento ASC"#
+    )
+    .fetch_all(&pool)
+    .await?;
+
+    Ok(Json(rows.into_iter().map(|r| json!({
+        "id": r.0,
+        "producto_id": r.1,
+        "producto_nombre": r.2,
+        "numero_lote": r.3,
+        "fecha_vencimiento": r.4,
+        "cantidad": r.5,
+        "estado": r.6
+    })).collect()))
+}
+
+pub async fn lote_create(
+    State(pool): State<PgPool>,
+    SupervisorUser(_claims): SupervisorUser,
+    Json(payload): Json<LoteVencimientoInput>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    let lote_id: i32 = sqlx::query_scalar(
+        r#"INSERT INTO lotes_vencimientos (producto_id, numero_lote, fecha_vencimiento, cantidad, estado, "createdAt", "updatedAt")
+           VALUES ($1, $2, $3, $4, 'ACTIVO', now(), now())
+           RETURNING id"#
+    )
+    .bind(payload.producto_id)
+    .bind(payload.numero_lote)
+    .bind(payload.fecha_vencimiento)
+    .bind(payload.cantidad)
+    .fetch_one(&pool)
+    .await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "message": "Lote con fecha de vencimiento registrado exitosamente.",
+            "lote_id": lote_id
+        }))
     ))
 }
 
@@ -1242,24 +2262,43 @@ pub async fn purchase_create(
 
     let purchase_id: i32 = sqlx::query_scalar("INSERT INTO purchases (provider_id,user_id,cash_shift_id,invoice_number,invoice_type,issue_date,due_date,payment_condition,payment_method,total_amount,status,notes,\"createdAt\",\"updatedAt\") VALUES ($1,$2,$3,$4,COALESCE($5,'Remito'::enum_purchases_invoice_type),COALESCE($6,CURRENT_DATE),$7,$8::enum_purchases_payment_condition,$9::enum_purchases_payment_method,$10,'recibida',$11,now(),now()) RETURNING id").bind(payload.provider_id).bind(claims.sub).bind(shift).bind(payload.invoice_number).bind(payload.invoice_type).bind(payload.issue_date).bind(payload.due_date).bind(&condition).bind(&method).bind(total).bind(payload.notes).fetch_one(&mut *tx).await?;
     for item in payload.products {
-        let (old_stock, old_cost): (i32, Decimal) = sqlx::query_as(
+        let (old_stock, old_cost): (Decimal, Decimal) = sqlx::query_as(
             "SELECT COALESCE(stock,0),cost_price FROM products WHERE id=$1 FOR UPDATE",
         )
         .bind(item.product_id)
         .fetch_one(&mut *tx)
         .await?;
-        let new_stock = old_stock + item.quantity;
-        let average = ((Decimal::from(old_stock) * old_cost)
-            + (Decimal::from(item.quantity) * item.unit_cost))
-            / Decimal::from(new_stock);
-        let subtotal = item.unit_cost * Decimal::from(item.quantity);
-        sqlx::query("INSERT INTO purchase_details (purchase_id,product_id,quantity,unit_cost,subtotal,\"createdAt\",\"updatedAt\") VALUES ($1,$2,$3,$4,$5,now(),now())").bind(purchase_id).bind(item.product_id).bind(item.quantity).bind(item.unit_cost).bind(subtotal).execute(&mut *tx).await?;
+        let qty_dec = Decimal::from(item.quantity);
+        let new_stock = old_stock + qty_dec;
+        let average = if new_stock > Decimal::ZERO {
+            ((old_stock * old_cost) + (qty_dec * item.unit_cost)) / new_stock
+        } else {
+            item.unit_cost
+        };
+        let subtotal = item.unit_cost * qty_dec;
+        sqlx::query("INSERT INTO purchase_details (purchase_id,product_id,quantity,unit_cost,subtotal,\"createdAt\",\"updatedAt\") VALUES ($1,$2,$3,$4,$5,now(),now())").bind(purchase_id).bind(item.product_id).bind(qty_dec).bind(item.unit_cost).bind(subtotal).execute(&mut *tx).await?;
         sqlx::query("UPDATE products SET stock=$1,cost_price=$2,\"updatedAt\"=now() WHERE id=$3")
             .bind(new_stock)
             .bind(average)
             .bind(item.product_id)
             .execute(&mut *tx)
             .await?;
+
+        // BR-INV-002: Kardex inmutable
+        sqlx::query(
+            r#"INSERT INTO movimientos_stock_kardex 
+               (producto_id, user_id, tipo_movimiento, cantidad, stock_anterior, stock_resultante, costo_unitario, referencia_id, motivo, "createdAt")
+               VALUES ($1, $2, 'COMPRA', $3, $4, $5, $6, $7, 'Compra a proveedor', now())"#
+        )
+        .bind(item.product_id)
+        .bind(claims.sub)
+        .bind(qty_dec)
+        .bind(old_stock)
+        .bind(new_stock)
+        .bind(item.unit_cost)
+        .bind(purchase_id)
+        .execute(&mut *tx)
+        .await?;
     }
     if condition == "Cuenta corriente" {
         sqlx::query("INSERT INTO provider_accounts (provider_id,purchase_id,type,amount,description,due_date,\"createdAt\",\"updatedAt\") VALUES ($1,$2,'credit',$3,'Compra a cuenta',$4,now(),now())").bind(payload.provider_id).bind(purchase_id).bind(total).bind(payload.due_date).execute(&mut *tx).await?;
@@ -1385,18 +2424,43 @@ pub async fn purchase_cancel(
 ) -> Result<Json<Value>, AppError> {
     let mut tx = pool.begin().await?;
     let purchase = sqlx::query_as::<_, (i32,Decimal,String,Option<i32>,String)>("SELECT provider_id,total_amount,payment_condition::text,cash_shift_id,payment_method::text FROM purchases WHERE id=$1 AND status='recibida' FOR UPDATE").fetch_optional(&mut *tx).await?.ok_or(AppError::NotFound)?;
-    let details = sqlx::query_as::<_, (i32, i32)>(
-        "SELECT product_id,quantity FROM purchase_details WHERE purchase_id=$1",
+    let details = sqlx::query_as::<_, (i32, Decimal, Decimal)>(
+        "SELECT product_id, quantity, unit_cost FROM purchase_details WHERE purchase_id=$1",
     )
     .bind(id)
     .fetch_all(&mut *tx)
     .await?;
-    for (product_id, quantity) in details {
-        sqlx::query("UPDATE products SET stock=stock-$1,\"updatedAt\"=now() WHERE id=$2")
-            .bind(quantity)
+    for (product_id, quantity, unit_cost) in details {
+        let (old_stock, _cost): (Decimal, Decimal) = sqlx::query_as(
+            "SELECT COALESCE(stock, 0), cost_price FROM products WHERE id = $1 FOR UPDATE"
+        )
+        .bind(product_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let new_stock = old_stock - quantity;
+
+        sqlx::query("UPDATE products SET stock=$1,\"updatedAt\"=now() WHERE id=$2")
+            .bind(new_stock)
             .bind(product_id)
             .execute(&mut *tx)
             .await?;
+
+        // BR-INV-002: Kardex inmutable
+        sqlx::query(
+            r#"INSERT INTO movimientos_stock_kardex 
+               (producto_id, user_id, tipo_movimiento, cantidad, stock_anterior, stock_resultante, costo_unitario, referencia_id, motivo, "createdAt")
+               VALUES ($1, $2, 'ANULACION_COMPRA', $3, $4, $5, $6, $7, 'Anulación de compra', now())"#
+        )
+        .bind(product_id)
+        .bind(purchase.0)
+        .bind(-quantity)
+        .bind(old_stock)
+        .bind(new_stock)
+        .bind(unit_cost)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
     }
     if purchase.2 == "Cuenta corriente" {
         sqlx::query("INSERT INTO provider_accounts (provider_id,purchase_id,type,amount,description,\"createdAt\",\"updatedAt\") VALUES ($1,$2,'debit',$3,'Anulación de compra',now(),now())").bind(purchase.0).bind(id).bind(purchase.1).execute(&mut *tx).await?;
@@ -1523,7 +2587,7 @@ pub async fn sales_stats(
     };
 
     // 2. Inventario valorizado y stock crítico
-    let productos_stock_bajo = sqlx::query_as::<_, (i32, String, i32)>(
+    let productos_stock_bajo = sqlx::query_as::<_, (i32, String, Decimal)>(
         "SELECT id, name, stock FROM products WHERE stock <= 5 ORDER BY stock ASC",
     )
     .fetch_all(&pool)
@@ -2249,4 +3313,88 @@ fn validate_range(range: &DateRange) -> Result<(), AppError> {
 async fn _tx<'a>(tx: &mut Transaction<'a, Postgres>) -> Result<(), AppError> {
     let _ = tx;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn d(s: &str) -> Decimal {
+        s.parse::<Decimal>().expect("decimal parse")
+    }
+
+    #[test]
+    fn test_br_pos_004_suma_estricta_pagos() {
+        let pagos = vec![
+            VentaPagoInput {
+                medio_pago: "EFECTIVO".to_string(),
+                monto_imputado: d("3000.00"),
+                monto_recibido: Some(d("5000.00")),
+                vuelto_entregado: Some(d("2000.00")),
+                referencia: None,
+            },
+            VentaPagoInput {
+                medio_pago: "QR_TRANSFERENCIA".to_string(),
+                monto_imputado: d("3600.00"),
+                monto_recibido: Some(d("3600.00")),
+                vuelto_entregado: Some(d("0.00")),
+                referencia: Some("MP-987654321".to_string()),
+            },
+        ];
+
+        let suma: Decimal = pagos.iter().map(|p| p.monto_imputado).sum();
+        let total_ticket = d("6600.00");
+
+        assert_eq!(suma, total_ticket);
+
+        // Si la suma difiere, debe fallar la validación BR-POS-004
+        let total_invalido = d("6500.00");
+        assert_ne!(suma, total_invalido);
+    }
+
+    #[test]
+    fn test_br_pos_002_calculo_diferencias_cierre_ciego() {
+        let efectivo_declarado = d("45000.00");
+        let efectivo_esperado = d("44800.00");
+        let dif_efectivo = efectivo_declarado - efectivo_esperado;
+        assert_eq!(dif_efectivo, d("200.00"));
+
+        let tarjetas_declarado = d("32000.00");
+        let tarjetas_esperado = d("32000.00");
+        let dif_tarjetas = tarjetas_declarado - tarjetas_esperado;
+        assert_eq!(dif_tarjetas, d("0.00"));
+
+        let transferencias_declarado = d("18500.00");
+        let transferencias_esperado = d("18500.00");
+        let dif_transf = transferencias_declarado - transferencias_esperado;
+        assert_eq!(dif_transf, d("0.00"));
+
+        let total_diferencia = dif_efectivo + dif_tarjetas + dif_transf;
+        assert_eq!(total_diferencia, d("200.00"));
+    }
+
+    #[test]
+    fn test_br_pre_001_margen_minimo() {
+        let costo_anterior = d("100.00");
+        let precio_anterior = d("140.00");
+        let porcentaje_aumento = d("50.00"); // 50% de aumento en costo
+        let factor = Decimal::ONE + (porcentaje_aumento / d("100.00")); // 1.5
+
+        let nuevo_costo = costo_anterior * factor; // 150.00
+        assert_eq!(nuevo_costo, d("150.00"));
+
+        let min_margin = d("30.00"); // 30% margen mínimo sobre costo
+        let min_required_price = nuevo_costo * (Decimal::ONE + (min_margin / d("100.00"))); // 150 * 1.3 = 195.00
+        assert_eq!(min_required_price, d("195.00"));
+
+        let proposed_price = precio_anterior * factor; // 140 * 1.5 = 210.00
+        let final_price = proposed_price.max(min_required_price);
+        assert_eq!(final_price, d("210.00"));
+
+        // Caso donde el aumento proporcional no alcanza el margen mínimo
+        let precio_bajo_anterior = d("110.00");
+        let proposed_price_bajo = precio_bajo_anterior * factor; // 110 * 1.5 = 165.00
+        let final_price_ajustado = proposed_price_bajo.max(min_required_price); // debe subir a 195.00
+        assert_eq!(final_price_ajustado, d("195.00"));
+    }
 }

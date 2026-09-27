@@ -103,6 +103,7 @@ pub async fn login(
             id: user.id,
             username: user.username,
             role,
+            has_supervisor_pin: user.pin_supervisor.is_some(),
         },
     }))
 }

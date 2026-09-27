@@ -1,4 +1,4 @@
-use crate::auth::hash_password;
+use crate::auth::{hash_password, verify_password};
 use crate::errors::AppError;
 use crate::extractors::AdminUser;
 use crate::models::user::{RegisterUser, Role, UpdateUser};
@@ -7,16 +7,29 @@ use axum::{
     extract::{Path, State},
     Json,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::PgPool;
 
-// Solo Administrador puede listar usuarios
+#[derive(Debug, Deserialize)]
+pub struct VerifyPinRequest {
+    pub pin: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VerifyPinResponse {
+    pub valid: bool,
+    pub supervisor_id: Option<i32>,
+    pub supervisor_name: Option<String>,
+}
+
+// Solo Administrador o Dueño puede listar usuarios
 pub async fn list(
     State(pool): State<PgPool>,
     AdminUser(_claims): AdminUser,
 ) -> Result<Json<Vec<UserPublic>>, AppError> {
     let users = sqlx::query_as::<_, User>(
-        r#"SELECT id, username, role, password, "createdAt", "updatedAt" FROM users ORDER BY id"#,
+        r#"SELECT id, username, role, password, pin_supervisor, "createdAt", "updatedAt" FROM users ORDER BY id"#,
     )
     .fetch_all(&pool)
     .await?;
@@ -27,6 +40,7 @@ pub async fn list(
             id: u.id,
             username: u.username,
             role: u.role,
+            has_supervisor_pin: u.pin_supervisor.is_some(),
         })
         .collect();
 
@@ -45,14 +59,25 @@ pub async fn create(
     }
 
     let password = hash_password(&payload.password).map_err(|_| AppError::Internal)?;
+    let pin_hash = if let Some(pin) = payload.pin_supervisor {
+        if !pin.trim().is_empty() {
+            Some(hash_password(pin.trim()).map_err(|_| AppError::Internal)?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let user = sqlx::query_as::<_, User>(
-        r#"INSERT INTO users (username, role, password, "createdAt", "updatedAt")
-           VALUES ($1, $2, $3, now(), now())
-           RETURNING id, username, role, password, "createdAt", "updatedAt""#,
+        r#"INSERT INTO users (username, role, password, pin_supervisor, "createdAt", "updatedAt")
+           VALUES ($1, $2, $3, $4, now(), now())
+           RETURNING id, username, role, password, pin_supervisor, "createdAt", "updatedAt""#,
     )
     .bind(payload.username)
     .bind(payload.role)
     .bind(password)
+    .bind(pin_hash)
     .fetch_one(&pool)
     .await?;
 
@@ -62,6 +87,7 @@ pub async fn create(
             id: user.id,
             username: user.username,
             role: user.role,
+            has_supervisor_pin: user.pin_supervisor.is_some(),
         }})),
     ))
 }
@@ -81,23 +107,23 @@ pub async fn update(
             "El password debe tener al menos 8 caracteres".into(),
         ));
     }
-    if claims.sub == id && payload.role == Some(Role::Empleado) {
+    if claims.sub == id && payload.role.as_ref().is_some_and(|r| !r.is_admin_or_owner()) {
         return Err(AppError::BadRequest(
             "No puedes degradar tu propia cuenta".into(),
         ));
     }
-    if payload.role == Some(Role::Empleado) {
+    if payload.role.as_ref().is_some_and(|r| !r.is_admin_or_owner()) {
         let target_role: Option<Role> = sqlx::query_scalar("SELECT role FROM users WHERE id=$1")
             .bind(id)
             .fetch_optional(&pool)
             .await?;
         let admins: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE role='Administrador'")
+            sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE role='Administrador' OR role='Dueño'")
                 .fetch_one(&pool)
                 .await?;
-        if target_role == Some(Role::Administrador) && admins <= 1 {
+        if target_role.as_ref().is_some_and(|r| r.is_admin_or_owner()) && admins <= 1 {
             return Err(AppError::BadRequest(
-                "Debe existir al menos un administrador".into(),
+                "Debe existir al menos un administrador o dueño".into(),
             ));
         }
     }
@@ -107,18 +133,31 @@ pub async fn update(
         .map(|value| hash_password(&value))
         .transpose()
         .map_err(|_| AppError::Internal)?;
+
+    let pin_hash = if let Some(pin) = payload.pin_supervisor {
+        if !pin.trim().is_empty() {
+            Some(hash_password(pin.trim()).map_err(|_| AppError::Internal)?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let user = sqlx::query_as::<_, User>(
         r#"UPDATE users SET
              username = COALESCE($1, username),
              role = COALESCE($2, role),
              password = COALESCE($3, password),
+             pin_supervisor = COALESCE($4, pin_supervisor),
              "updatedAt" = now()
-           WHERE id = $4
-           RETURNING id, username, role, password, "createdAt", "updatedAt""#,
+           WHERE id = $5
+           RETURNING id, username, role, password, pin_supervisor, "createdAt", "updatedAt""#,
     )
     .bind(payload.username)
     .bind(payload.role)
     .bind(password)
+    .bind(pin_hash)
     .bind(id)
     .fetch_one(&pool)
     .await?;
@@ -128,11 +167,12 @@ pub async fn update(
             id: user.id,
             username: user.username,
             role: user.role,
+            has_supervisor_pin: user.pin_supervisor.is_some(),
         }}),
     ))
 }
 
-// Solo Administrador puede borrar usuarios
+// Solo Administrador o Dueño puede borrar usuarios
 pub async fn delete(
     State(pool): State<PgPool>,
     AdminUser(claims): AdminUser,
@@ -144,16 +184,16 @@ pub async fn delete(
         ));
     }
 
-    let admins: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE role = 'Administrador'")
+    let admins: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE role = 'Administrador' OR role = 'Dueño'")
         .fetch_one(&pool)
         .await?;
     let target_role: Option<Role> = sqlx::query_scalar("SELECT role FROM users WHERE id = $1")
         .bind(id)
         .fetch_optional(&pool)
         .await?;
-    if target_role == Some(Role::Administrador) && admins <= 1 {
+    if target_role.as_ref().is_some_and(|r| r.is_admin_or_owner()) && admins <= 1 {
         return Err(AppError::BadRequest(
-            "Debe existir al menos un administrador".into(),
+            "Debe existir al menos un administrador o dueño".into(),
         ));
     }
 
@@ -174,4 +214,43 @@ pub async fn delete(
     }
 
     Ok(Json(json!({ "message": "Usuario eliminado." })))
+}
+
+// Endpoint para validar PIN de supervisor en POS para anulaciones (BR-POS-003)
+pub async fn verify_supervisor_pin(
+    State(pool): State<PgPool>,
+    Json(payload): Json<VerifyPinRequest>,
+) -> Result<Json<VerifyPinResponse>, AppError> {
+    let pin = payload.pin.trim();
+    if pin.is_empty() {
+        return Ok(Json(VerifyPinResponse {
+            valid: false,
+            supervisor_id: None,
+            supervisor_name: None,
+        }));
+    }
+
+    let supervisors = sqlx::query_as::<_, (i32, String, String)>(
+        r#"SELECT id, username, pin_supervisor FROM users 
+           WHERE (role = 'Administrador' OR role = 'Dueño' OR role = 'Encargado') 
+             AND pin_supervisor IS NOT NULL"#,
+    )
+    .fetch_all(&pool)
+    .await?;
+
+    for (id, username, hash) in supervisors {
+        if verify_password(pin, &hash) {
+            return Ok(Json(VerifyPinResponse {
+                valid: true,
+                supervisor_id: Some(id),
+                supervisor_name: Some(username),
+            }));
+        }
+    }
+
+    Ok(Json(VerifyPinResponse {
+        valid: false,
+        supervisor_id: None,
+        supervisor_name: None,
+    }))
 }

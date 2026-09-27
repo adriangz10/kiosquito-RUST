@@ -1,6 +1,6 @@
 use axum::{
     middleware as axum_middleware,
-    routing::{get, post},
+    routing::{get, post, put},
     Router,
 };
 use sqlx::PgPool;
@@ -16,6 +16,15 @@ pub fn products_routes() -> Router<PgPool> {
         .route(
             "/products/barcode/{barcode}",
             get(handlers::products::get_by_barcode),
+        )
+        // Contrato 3 (Fase 7.1) y BR-PRE-001: Aumento Masivo de Precios
+        .route(
+            "/products/aumento-masivo",
+            put(handlers::products::aumento_masivo),
+        )
+        .route(
+            "/productos/aumento-masivo",
+            put(handlers::products::aumento_masivo),
         )
         .route(
             "/products/{id}",
@@ -64,7 +73,12 @@ pub fn providers_routes() -> Router<PgPool> {
 
 pub fn auth_routes() -> Router<PgPool> {
     // Públicas, sin guard
-    Router::new().route("/auth/login", post(handlers::auth::login))
+    Router::new()
+        .route("/auth/login", post(handlers::auth::login))
+        .route(
+            "/auth/verify-supervisor-pin",
+            post(handlers::users::verify_supervisor_pin),
+        )
 }
 
 pub fn users_routes() -> Router<PgPool> {
@@ -85,21 +99,22 @@ pub fn users_routes() -> Router<PgPool> {
             "/auth/users/{id}",
             axum::routing::delete(handlers::users::delete).put(handlers::users::update),
         )
-        // el .layer() acá es el "AuthGuard global" — corre ANTES de llegar al handler
         .layer(axum::middleware::from_fn(middleware::auth::auth_guard))
 }
 
 pub fn api_routes() -> Router<PgPool> {
-    Router::new().nest(
-        "/api",
-        Router::new()
-            .merge(products_routes())
-            .merge(categories_routes())
-            .merge(providers_routes())
-            .merge(auth_routes())
-            .merge(users_routes())
-            .merge(financial_routes()),
-    )
+    let subroutes = Router::new()
+        .merge(products_routes())
+        .merge(categories_routes())
+        .merge(providers_routes())
+        .merge(auth_routes())
+        .merge(users_routes())
+        .merge(financial_routes());
+
+    // Soporte simultáneo para /api y /api/v1 especificado en el PDF
+    Router::new()
+        .nest("/api", subroutes.clone())
+        .nest("/api/v1", subroutes)
 }
 
 fn financial_routes() -> Router<PgPool> {
@@ -140,6 +155,7 @@ fn financial_routes() -> Router<PgPool> {
             "/expenses/summary",
             get(handlers::financial::expense_summary),
         )
+        // Cajas
         .route("/cash-shifts/open", post(handlers::financial::cash_open))
         .route(
             "/cash-shifts/current",
@@ -150,6 +166,18 @@ fn financial_routes() -> Router<PgPool> {
             "/cash-shifts/history",
             get(handlers::financial::cash_history),
         )
+        // Contrato 2 (Fase 7.1): Cierre Ciego de Caja
+        .route("/cajas/cierres", post(handlers::financial::pos_cierre_ciego))
+        // RF-CAJ-002: Sangrías y movimientos de caja
+        .route(
+            "/cajas/movimientos",
+            post(handlers::financial::caja_movimiento_create),
+        )
+        .route(
+            "/cajas/movimientos/{caja_sesion_id}",
+            get(handlers::financial::caja_movimientos_list),
+        )
+        // Ventas y POS
         .route("/sales", post(handlers::financial::sale_create))
         .route("/sales/history", get(handlers::financial::sales_history))
         .route("/sales/{id}", get(handlers::financial::sale_get))
@@ -158,6 +186,26 @@ fn financial_routes() -> Router<PgPool> {
             axum::routing::patch(handlers::financial::sale_cancel)
                 .put(handlers::financial::sale_cancel),
         )
+        // Contrato 1 (Fase 7.1) y BR-POS-004: Venta Multimedio
+        .route("/pos/ventas", post(handlers::financial::pos_venta_create))
+        // Inventario, Kardex (BR-INV-002) y Vencimientos (RF-INV-003)
+        .route(
+            "/inventario/kardex",
+            get(handlers::financial::kardex_list),
+        )
+        .route(
+            "/inventario/ajuste",
+            post(handlers::financial::inventario_ajuste),
+        )
+        .route(
+            "/inventario/vencimientos",
+            get(handlers::financial::vencimientos_list),
+        )
+        .route(
+            "/inventario/lotes",
+            post(handlers::financial::lote_create),
+        )
+        // Compras y Proveedores
         .route(
             "/purchases",
             get(handlers::financial::purchases).post(handlers::financial::purchase_create),

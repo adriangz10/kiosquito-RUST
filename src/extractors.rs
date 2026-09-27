@@ -1,5 +1,4 @@
 use crate::auth::Claims;
-use crate::models::user::Role;
 use axum::{
     extract::FromRequestParts,
     http::{request::Parts, StatusCode},
@@ -26,7 +25,7 @@ impl<S: Send + Sync> FromRequestParts<S> for AuthUser {
     }
 }
 
-// Solo usuarios con rol Administrador
+// Usuarios con rol Administrador o Dueño
 pub struct AdminUser(pub Claims);
 
 impl<S: Send + Sync> FromRequestParts<S> for AdminUser {
@@ -34,12 +33,30 @@ impl<S: Send + Sync> FromRequestParts<S> for AdminUser {
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let AuthUser(claims) = AuthUser::from_request_parts(parts, state).await?;
-        if claims.role != Role::Administrador {
+        if !claims.role.is_admin_or_owner() {
             return Err((
                 StatusCode::FORBIDDEN,
-                Json(json!({"message":"Acceso denegado. Se requiere rol de administrador."})),
+                Json(json!({"message":"Acceso denegado. Se requiere rol de administrador o dueño."})),
             ));
         }
         Ok(AdminUser(claims))
+    }
+}
+
+// Supervisores: Administrador, Dueño o Encargado
+pub struct SupervisorUser(pub Claims);
+
+impl<S: Send + Sync> FromRequestParts<S> for SupervisorUser {
+    type Rejection = (StatusCode, Json<serde_json::Value>);
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let AuthUser(claims) = AuthUser::from_request_parts(parts, state).await?;
+        if !claims.role.is_supervisor() {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({"message":"Acceso denegado. Se requiere rol de supervisor (Administrador, Dueño o Encargado)."})),
+            ));
+        }
+        Ok(SupervisorUser(claims))
     }
 }

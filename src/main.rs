@@ -5,6 +5,7 @@ mod extractors;
 mod handlers;
 mod middleware;
 mod models;
+mod outbox;
 mod routes;
 
 use axum::{
@@ -21,6 +22,9 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     let pool = db::connect().await;
+
+    // Fase 6.1: Iniciar worker en segundo plano para sincronización y Outbox Pattern
+    outbox::spawn_outbox_worker(pool.clone());
 
     let app = Router::new()
         .route("/health", get(handlers::health::check))
